@@ -2,26 +2,11 @@
  * bot.js — OKX Pairs Divergence Bot (Dry Run)
  * 
  * Strategy: Pairs Divergence
+ * Scan BTC + ETH 5-min event contracts simultaneously.
+ * Buy opposite sides when combined ≤ 80¢.
+ * Profit in 3/4 scenarios.
  * 
- * Scans BTC and ETH 5-min event contracts simultaneously.
- * Looks for opposite-side underdogs that are both cheap:
- *   - BTC UP cheap + ETH DOWN cheap → buy both (bet BTC up, ETH down)
- *   - BTC DOWN cheap + ETH UP cheap → buy both (bet BTC down, ETH up)
- * 
- * Enter when combined price ≤ 80¢ (e.g., BTC UP @ 35¢ + ETH DOWN @ 35¢ = 70¢)
- * 
- * Why it works — 4 scenarios at settlement:
- *   1. BTC UP wins + ETH DOWN wins → BOTH HIT → +$2 on $0.70 cost = +$1.30
- *   2. BTC UP wins + ETH DOWN loses → ONE HIT → +$1 on $0.70 cost = +$0.30
- *   3. BTC UP loses + ETH DOWN wins → ONE HIT → +$1 on $0.70 cost = +$0.30
- *   4. BTC UP loses + ETH DOWN loses → MISS → $0 on $0.70 cost = -$0.70
- * 
- * Profit in 3/4 scenarios. Only lose when BTC and ETH move together 
- * in the SAME direction (both up or both down), which is the one 
- * scenario your bet is against.
- * 
- * MODE: Dry run (paper trading) — no real orders.
- * DATA: REAL OKX market data.
+ * Heartbeat: prints PnL + win rate every 30 seconds.
  */
 
 const OKXClient = require('./okxClient');
@@ -30,8 +15,7 @@ const logger = require('./logger');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Instrument ID helper ──────────────────────────────────────
-// Format: BTC-UPDOWN-5MIN-YYMMDD-HHMM-HHMM (Beijing time UTC+8)
+// ── Instrument ID (Beijing time UTC+8) ─────────────────────────
 function getInstId(underlying, interval) {
   const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
   const yy = String(now.getUTCFullYear()).slice(2);
@@ -58,37 +42,75 @@ function getSecondsRemaining(interval) {
 // ── Global Stats ──────────────────────────────────────────────
 const stats = {
   cycles: 0,
-  pairsTrades: 0,       // Total pairs trades entered
-  bothHit: 0,           // Both sides won (big win)
-  oneHit: 0,            // One side won (small profit)
-  totalMiss: 0,         // Both sides lost
-  totalInvested: 0,     // Total USDT "spent" on both sides
-  totalReturned: 0,      // Total USDT "received" from winners
+  pairsTrades: 0,
+  bothHit: 0,
+  oneHit: 0,
+  totalMiss: 0,
+  totalInvested: 0,
+  totalReturned: 0,
   bestTrade: null,
   worstTrade: null,
   tradeHistory: [],
-  // Track individual legs too
   btcLegs: { trades: 0, wins: 0, losses: 0 },
   ethLegs: { trades: 0, wins: 0, losses: 0 },
+  startTime: Date.now(),
 };
 
-// ── Running stats line ────────────────────────────────────────
+// ── Live price snapshot (updated every poll) ──────────────────
+const livePrices = {
+  btcUp: 0, btcDown: 0, ethUp: 0, ethDown: 0,
+  btcSpot: 0, ethSpot: 0,
+  lastUpdate: 0,
+};
+
+// ── Heartbeat: print PnL + win rate every 30s ──────────────────
+function startHeartbeat() {
+  setInterval(() => {
+    const t = stats.pairsTrades;
+    const wins = stats.bothHit + stats.oneHit;
+    const wr = t > 0 ? ((wins / t) * 100).toFixed(1) : '0.0';
+    const netPnl = stats.totalReturned - stats.totalInvested;
+    const roi = stats.totalInvested > 0 ? ((netPnl / stats.totalInvested) * 100).toFixed(1) : '0.0';
+    const sign = netPnl >= 0 ? '+' : '';
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
+    const upMin = Math.floor(uptime / 60);
+    const upSec = uptime % 60;
+
+    // Live price line
+    let priceLine = '';
+    if (livePrices.lastUpdate > 0) {
+      const bestCombo = Math.min(
+        livePrices.btcUp + livePrices.ethDown,
+        livePrices.btcDown + livePrices.ethUp
+      );
+      const comboStr = bestCombo > 0 ? (bestCombo * 100).toFixed(1) : '—';
+      priceLine = ` | BTC ↑${(livePrices.btcUp * 100).toFixed(0)}¢ ↓${(livePrices.btcDown * 100).toFixed(0)}¢ | ETH ↑${(livePrices.ethUp * 100).toFixed(0)}¢ ↓${(livePrices.ethDown * 100).toFixed(0)}¢ | Best combo: ${comboStr}¢`;
+    }
+
+    console.log(
+      `${logger.COLORS.gray}[${new Date().toLocaleTimeString('en-US', { hour12: false })}]${logger.COLORS.reset} ` +
+      `${logger.COLORS.bold}📊 [${upMin}m${upSec}s] ` +
+      `Trades: ${t} | W:${wins} L:${stats.totalMiss} | WR: ${wr}% | ` +
+      `PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%` +
+      `${priceLine}${logger.COLORS.reset}`
+    );
+  }, 30000); // every 30 seconds
+}
+
+// ── Print running stats after each trade ──────────────────────
 function printRunningStats() {
   const t = stats.pairsTrades;
-  const wr = t > 0 ? (((stats.bothHit + stats.oneHit) / t) * 100).toFixed(1) : '0.0';
+  const wins = stats.bothHit + stats.oneHit;
+  const wr = t > 0 ? ((wins / t) * 100).toFixed(1) : '0.0';
   const netPnl = stats.totalReturned - stats.totalInvested;
-  const roi = stats.totalInvested > 0
-    ? ((netPnl / stats.totalInvested) * 100).toFixed(1)
-    : '0.0';
+  const roi = stats.totalInvested > 0 ? ((netPnl / stats.totalInvested) * 100).toFixed(1) : '0.0';
   const sign = netPnl >= 0 ? '+' : '';
 
   logger.info(
-    `${logger.COLORS.bold}📦 RUNNING: ${t} pairs trades | ` +
-    `Both: ${stats.bothHit} | One: ${stats.oneHit} | Miss: ${stats.totalMiss} | ` +
-    `Win rate: ${wr}% | PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${logger.COLORS.reset}`
+    `${logger.COLORS.bold}📦 RESULT: ${t} pairs | Both: ${stats.bothHit} | One: ${stats.oneHit} | Miss: ${stats.totalMiss} | ` +
+    `WR: ${wr}% | PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${logger.COLORS.reset}`
   );
 
-  // Per-leg stats
   const btcWR = stats.btcLegs.trades > 0 ? ((stats.btcLegs.wins / stats.btcLegs.trades) * 100).toFixed(0) : '—';
   const ethWR = stats.ethLegs.trades > 0 ? ((stats.ethLegs.wins / stats.ethLegs.trades) * 100).toFixed(0) : '—';
   logger.info(
@@ -97,7 +119,7 @@ function printRunningStats() {
   );
 }
 
-// ── Full summary ──────────────────────────────────────────────
+// ── Full summary every 5 cycles ───────────────────────────────
 function printSummary() {
   const t = stats.pairsTrades;
   const wins = stats.bothHit + stats.oneHit;
@@ -109,7 +131,7 @@ function printSummary() {
   logger.banner('📊 PAIRS DIVERGENCE — CUMULATIVE STATS');
   logger.line(`Cycles watched: ${stats.cycles}`);
   logger.line(`Pairs trades: ${t}`);
-  logger.line(`Both hit (2x win): ${stats.bothHit} | One hit (1x win): ${stats.oneHit} | Miss (both lose): ${stats.totalMiss}`);
+  logger.line(`Both hit: ${stats.bothHit} | One hit: ${stats.oneHit} | Miss: ${stats.totalMiss}`);
   logger.line(`Win rate: ${wr}% (profit in ${wins}/${t} trades)`);
   logger.line('');
   logger.line(`Invested:  $${stats.totalInvested.toFixed(2)}`);
@@ -144,10 +166,9 @@ function printSummary() {
 
 // ── Run one cycle ──────────────────────────────────────────────
 async function runCycle(client) {
-  const interval = 5; // 5 min
+  const interval = 5;
   const intervalSec = interval * 60;
 
-  // Wait for cycle to align
   let secsRemaining = getSecondsRemaining(interval);
   if (secsRemaining < intervalSec - 2) {
     const wait = secsRemaining + 2;
@@ -168,7 +189,7 @@ async function runCycle(client) {
   logger.info(`CYCLE ${stats.cycles} | BTC: ${btcInstId.slice(-15)} | ETH: ${ethInstId.slice(-15)}`);
   logger.info(`${secIn}s in, ${secLeft}s left | ${new Date().toUTCString()}`);
 
-  // 1. Get opening prices for both
+  // 1. Opening prices
   const [btcOpen, ethOpen] = await Promise.all([
     client.getSpotPrice('BTC-USDT'),
     client.getSpotPrice('ETH-USDT'),
@@ -182,10 +203,9 @@ async function runCycle(client) {
 
   logger.info(`📏 Opening: BTC $${btcOpen} | ETH $${ethOpen}`);
 
-  // Wait for contracts to be active
   if (getSecondsIntoCycle(interval) < 5) await sleep(5000);
 
-  // 2. Poll both simultaneously, look for pairs opportunity
+  // 2. Poll both, look for pairs opportunity
   let entered = false;
   let btcEntry = 0, ethEntry = 0;
   let btcSide = '', ethSide = '';
@@ -193,7 +213,6 @@ async function runCycle(client) {
   let pollCount = 0;
 
   while (getSecondsRemaining(interval) > config.strategy.noEntryBeforeEnd) {
-    // Fetch both tickers at the same time
     const [btcTicker, ethTicker] = await Promise.all([
       client.getEventTicker(btcInstId),
       client.getEventTicker(ethInstId),
@@ -211,12 +230,17 @@ async function runCycle(client) {
     const ethUp = ethTicker.last;
     const ethDown = 1 - ethUp;
 
+    // Update live prices for heartbeat
+    livePrices.btcUp = btcUp;
+    livePrices.btcDown = btcDown;
+    livePrices.ethUp = ethUp;
+    livePrices.ethDown = ethDown;
+    livePrices.lastUpdate = Date.now();
+
     if (!entered) {
-      // ── Check all 4 combos for pairs opportunity ────────────
-      // We want opposite sides: BTC UP + ETH DOWN, or BTC DOWN + ETH UP
       const combos = [
-        { btcSide: 'UP', ethSide: 'DOWN', btcPrice: btcUp,   ethPrice: ethDown },
-        { btcSide: 'DOWN', ethSide: 'UP', btcPrice: btcDown, ethPrice: ethUp   },
+        { btcSide: 'UP', ethSide: 'DOWN', btcPrice: btcUp, ethPrice: ethDown },
+        { btcSide: 'DOWN', ethSide: 'UP', btcPrice: btcDown, ethPrice: ethUp },
       ];
 
       let bestCombo = null;
@@ -235,7 +259,6 @@ async function runCycle(client) {
       }
 
       if (bestCombo) {
-        // Found a pairs opportunity!
         entered = true;
         btcEntry = bestCombo.btcPrice;
         ethEntry = bestCombo.ethPrice;
@@ -244,10 +267,10 @@ async function runCycle(client) {
         entryTime = getSecondsIntoCycle(interval);
 
         const combinedCost = btcEntry + ethEntry;
-        const costUsd = config.strategy.tradeSizeUsdt * 2; // both sides
+        const costUsd = config.strategy.tradeSizeUsdt * 2;
         const btcContracts = config.strategy.tradeSizeUsdt / btcEntry;
         const ethContracts = config.strategy.tradeSizeUsdt / ethEntry;
-        const maxPayout = btcContracts + ethContracts; // both win
+        const maxPayout = btcContracts + ethContracts;
         const oneWinPayout = Math.max(btcContracts, ethContracts);
 
         stats.pairsTrades++;
@@ -264,29 +287,16 @@ async function runCycle(client) {
           `ETH ${ethSide}: $${config.strategy.tradeSizeUsdt} → ${ethContracts.toFixed(1)} contracts`
         );
         logger.info(
-          `   Cost: $${costUsd} | ` +
-          `Both win: +$${(maxPayout - costUsd).toFixed(2)} | ` +
-          `One win: +$${(oneWinPayout - costUsd).toFixed(2)} | ` +
-          `Both lose: -$${costUsd} | ` +
+          `   Cost: $${costUsd} | Both win: +$${(maxPayout - costUsd).toFixed(2)} | ` +
+          `One win: +$${(oneWinPayout - costUsd).toFixed(2)} | Both lose: -$${costUsd} | ` +
           `Entry: ${entryTime}s`
         );
-
-        if (config.log.showOrderbook) {
-          logger.info(
-            `   📊 BTC UP=${(btcUp * 100).toFixed(1)}¢ DOWN=${(btcDown * 100).toFixed(1)}¢ | ` +
-            `ETH UP=${(ethUp * 100).toFixed(1)}¢ DOWN=${(ethDown * 100).toFixed(1)}¢`
-          );
-        }
       } else if (pollCount === 0 || pollCount % 5 === 0) {
-        // Log status periodically when no entry
-        const bestOpp = Math.min(
-          btcUp + ethDown,
-          btcDown + ethUp
-        );
+        const bestOpp = Math.min(btcUp + ethDown, btcDown + ethUp);
         logger.info(
-          `📊 BTC UP=${(btcUp * 100).toFixed(1)}¢ DOWN=${(btcDown * 100).toFixed(1)}¢ | ` +
-          `ETH UP=${(ethUp * 100).toFixed(1)}¢ DOWN=${(ethDown * 100).toFixed(1)}¢ | ` +
-          `Best combo: ${(bestOpp * 100).toFixed(1)}¢${bestOpp <= 0.80 ? ' ← ENTRY!' : ' (>80¢ no entry)'}`
+          `📊 BTC ↑${(btcUp * 100).toFixed(1)}¢ ↓${(btcDown * 100).toFixed(1)}¢ | ` +
+          `ETH ↑${(ethUp * 100).toFixed(1)}¢ ↓${(ethDown * 100).toFixed(1)}¢ | ` +
+          `Best combo: ${(bestOpp * 100).toFixed(1)}¢${bestOpp <= 0.80 ? ' ← ENTRY!' : ' (>80¢)'}`
         );
       }
     }
@@ -299,7 +309,7 @@ async function runCycle(client) {
   const remaining = getSecondsRemaining(interval);
   if (remaining > 0) await sleep(remaining * 1000);
 
-  // 4. Get settlement prices
+  // 4. Settlement prices
   await sleep(2000);
   const [btcSettle, ethSettle] = await Promise.all([
     client.getSpotPrice('BTC-USDT'),
@@ -323,7 +333,7 @@ async function runCycle(client) {
     `ETH $${ethSettle} (${ethChange >= 0 ? '+' : ''}$${ethChange.toFixed(2)} → ${ethWinner})`
   );
 
-  // 6. Track trade result
+  // 6. Track result
   if (entered) {
     const costUsd = config.strategy.tradeSizeUsdt * 2;
     const btcContracts = config.strategy.tradeSizeUsdt / btcEntry;
@@ -381,16 +391,10 @@ async function runCycle(client) {
     const record = {
       time: new Date().toISOString(),
       cycle: stats.cycles,
-      btcSide, ethSide,
-      btcEntry, ethEntry,
-      combinedCost,
-      btcOpen, ethOpen,
-      btcSettle, ethSettle,
-      btcWinner, ethWinner,
-      btcResult, ethResult,
-      result, pnl,
-      cost: costUsd,
-      payout: totalPayout,
+      btcSide, ethSide, btcEntry, ethEntry, combinedCost,
+      btcOpen, ethOpen, btcSettle, ethSettle,
+      btcWinner, ethWinner, btcResult, ethResult,
+      result, pnl, cost: costUsd, payout: totalPayout,
     };
     stats.tradeHistory.push(record);
     if (stats.tradeHistory.length > 200) stats.tradeHistory.shift();
@@ -415,6 +419,7 @@ async function main() {
   logger.info(`Trade size: $${config.strategy.tradeSizeUsdt} per side ($${config.strategy.tradeSizeUsdt * 2} per pair)`);
   logger.info(`Max per side: ${(config.strategy.maxPerSide * 100).toFixed(0)}¢`);
   logger.info(`Profit in 3/4 scenarios — only lose when BTC & ETH move same direction`);
+  logger.info(`Heartbeat: PnL + win rate every 30 seconds`);
   logger.divider();
 
   const client = new OKXClient(config.okx);
@@ -436,11 +441,13 @@ async function main() {
 
   logger.info('🚀 Bot started. Scanning BTC + ETH event contracts...\n');
 
+  // Start 30-second heartbeat
+  startHeartbeat();
+
   while (true) {
     try {
       await runCycle(client);
 
-      // Full summary every 5 cycles
       if (stats.cycles % 5 === 0) {
         printSummary();
       }
