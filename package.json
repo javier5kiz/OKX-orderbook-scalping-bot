@@ -1,0 +1,14 @@
+{
+  "name": "mexc-prediction-bot",
+  "version": "2.0.0",
+  "description": "OKX Underdog Value Bot — BTC/ETH 5min event contracts, paper trading with real market data",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "node src/bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
