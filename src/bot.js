@@ -67,8 +67,9 @@ const livePrices = {
 function startHeartbeat() {
   setInterval(() => {
     const t = stats.pairsTrades;
+    const settled = stats.bothHit + stats.oneHit + stats.totalMiss;
     const wins = stats.bothHit + stats.oneHit;
-    const wr = t > 0 ? ((wins / t) * 100).toFixed(1) : '0.0';
+    const wr = settled > 0 ? ((wins / settled) * 100).toFixed(1) : '0.0';
     const netPnl = stats.totalReturned - stats.totalInvested;
     const roi = stats.totalInvested > 0 ? ((netPnl / stats.totalInvested) * 100).toFixed(1) : '0.0';
     const sign = netPnl >= 0 ? '+' : '';
@@ -76,22 +77,43 @@ function startHeartbeat() {
     const upMin = Math.floor(uptime / 60);
     const upSec = uptime % 60;
 
-    // Live price line
+    // Count open (unsettled) positions
+    const openCount = t - settled;
+
+    // Live price line with per-side check for entry signal
     let priceLine = '';
     if (livePrices.lastUpdate > 0) {
-      const bestCombo = Math.min(
-        livePrices.btcUp + livePrices.ethDown,
-        livePrices.btcDown + livePrices.ethUp
-      );
+      const combo1 = livePrices.btcUp + livePrices.ethDown;
+      const combo2 = livePrices.btcDown + livePrices.ethUp;
+      const bestCombo = Math.min(combo1, combo2);
       const comboStr = bestCombo > 0 ? (bestCombo * 100).toFixed(1) : '—';
-      priceLine = ` | BTC ↑${(livePrices.btcUp * 100).toFixed(0)}¢ ↓${(livePrices.btcDown * 100).toFixed(0)}¢ | ETH ↑${(livePrices.ethUp * 100).toFixed(0)}¢ ↓${(livePrices.ethDown * 100).toFixed(0)}¢ | Best combo: ${comboStr}¢`;
+      
+      // Check if best combo would actually pass per-side filter
+      const maxPerSide = config.strategy.maxPerSide;
+      let bestValid = false;
+      let bestSide = '';
+      if (combo1 <= config.strategy.maxCombinedPrice) {
+        const btcOk = livePrices.btcUp <= maxPerSide;
+        const ethOk = livePrices.ethDown <= maxPerSide;
+        if (btcOk && ethOk) { bestValid = true; bestSide = 'BTC↑+ETH↓'; }
+      }
+      if (!bestValid && combo2 <= config.strategy.maxCombinedPrice) {
+        const btcOk = livePrices.btcDown <= maxPerSide;
+        const ethOk = livePrices.ethUp <= maxPerSide;
+        if (btcOk && ethOk) { bestValid = true; bestSide = 'BTC↓+ETH↑'; }
+      }
+      
+      const entryFlag = bestValid ? ` ← ENTRY! (${bestSide})` : '';
+      priceLine = ` | BTC ↑${(livePrices.btcUp * 100).toFixed(0)}¢ ↓${(livePrices.btcDown * 100).toFixed(0)}¢ | ETH ↑${(livePrices.ethUp * 100).toFixed(0)}¢ ↓${(livePrices.ethDown * 100).toFixed(0)}¢ | Best: ${comboStr}¢${entryFlag}`;
     }
 
+    const openStr = openCount > 0 ? ` | 🔴 OPEN: ${openCount}` : '';
+    
     console.log(
       `${logger.COLORS.gray}[${new Date().toLocaleTimeString('en-US', { hour12: false })}]${logger.COLORS.reset} ` +
       `${logger.COLORS.bold}📊 [${upMin}m${upSec}s] ` +
       `Trades: ${t} | W:${wins} L:${stats.totalMiss} | WR: ${wr}% | ` +
-      `PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%` +
+      `PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${openStr}` +
       `${priceLine}${logger.COLORS.reset}`
     );
   }, 30000); // every 30 seconds
@@ -293,10 +315,18 @@ async function runCycle(client) {
         );
       } else if (pollCount === 0 || pollCount % 5 === 0) {
         const bestOpp = Math.min(btcUp + ethDown, btcDown + ethUp);
+        // Check per-side limits for display
+        let entryFlag = ' (>80¢)';
+        if (bestOpp <= config.strategy.maxCombinedPrice) {
+          const c1ok = btcUp <= config.strategy.maxPerSide && ethDown <= config.strategy.maxPerSide;
+          const c2ok = btcDown <= config.strategy.maxPerSide && ethUp <= config.strategy.maxPerSide;
+          if (c1ok || c2ok) entryFlag = ' ← ENTRY!';
+          else entryFlag = ` (combo ok but side >${(config.strategy.maxPerSide * 100).toFixed(0)}¢)`;
+        }
         logger.info(
           `📊 BTC ↑${(btcUp * 100).toFixed(1)}¢ ↓${(btcDown * 100).toFixed(1)}¢ | ` +
           `ETH ↑${(ethUp * 100).toFixed(1)}¢ ↓${(ethDown * 100).toFixed(1)}¢ | ` +
-          `Best combo: ${(bestOpp * 100).toFixed(1)}¢${bestOpp <= 0.80 ? ' ← ENTRY!' : ' (>80¢)'}`
+          `Best combo: ${(bestOpp * 100).toFixed(1)}¢${entryFlag}`
         );
       }
     }
