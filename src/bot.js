@@ -92,14 +92,15 @@ function startHeartbeat() {
       const maxPerSide = config.strategy.maxPerSide;
       let bestValid = false;
       let bestSide = '';
+      const minP = config.strategy.minPrice || 0.10;
       if (combo1 <= config.strategy.maxCombinedPrice) {
-        const btcOk = livePrices.btcUp <= maxPerSide;
-        const ethOk = livePrices.ethDown <= maxPerSide;
+        const btcOk = livePrices.btcUp <= maxPerSide && livePrices.btcUp >= minP;
+        const ethOk = livePrices.ethDown <= maxPerSide && livePrices.ethDown >= minP;
         if (btcOk && ethOk) { bestValid = true; bestSide = 'BTC↑+ETH↓'; }
       }
       if (!bestValid && combo2 <= config.strategy.maxCombinedPrice) {
-        const btcOk = livePrices.btcDown <= maxPerSide;
-        const ethOk = livePrices.ethUp <= maxPerSide;
+        const btcOk = livePrices.btcDown <= maxPerSide && livePrices.btcDown >= minP;
+        const ethOk = livePrices.ethUp <= maxPerSide && livePrices.ethUp >= minP;
         if (btcOk && ethOk) { bestValid = true; bestSide = 'BTC↓+ETH↑'; }
       }
       
@@ -268,11 +269,14 @@ async function runCycle(client) {
       let bestCombo = null;
       let bestCombined = 1;
 
+      const minPrice = config.strategy.minPrice || 0.10;
       for (const c of combos) {
         const combined = c.btcPrice + c.ethPrice;
         if (combined <= config.strategy.maxCombinedPrice &&
             c.btcPrice <= config.strategy.maxPerSide &&
-            c.ethPrice <= config.strategy.maxPerSide) {
+            c.ethPrice <= config.strategy.maxPerSide &&
+            c.btcPrice >= minPrice &&
+            c.ethPrice >= minPrice) {
           if (combined < bestCombined) {
             bestCombined = combined;
             bestCombo = c;
@@ -318,10 +322,11 @@ async function runCycle(client) {
         // Check per-side limits for display
         let entryFlag = ' (>80¢)';
         if (bestOpp <= config.strategy.maxCombinedPrice) {
-          const c1ok = btcUp <= config.strategy.maxPerSide && ethDown <= config.strategy.maxPerSide;
-          const c2ok = btcDown <= config.strategy.maxPerSide && ethUp <= config.strategy.maxPerSide;
+          const minP = config.strategy.minPrice || 0.10;
+          const c1ok = btcUp <= config.strategy.maxPerSide && btcUp >= minP && ethDown <= config.strategy.maxPerSide && ethDown >= minP;
+          const c2ok = btcDown <= config.strategy.maxPerSide && btcDown >= minP && ethUp <= config.strategy.maxPerSide && ethUp >= minP;
           if (c1ok || c2ok) entryFlag = ' ← ENTRY!';
-          else entryFlag = ` (combo ok but side >${(config.strategy.maxPerSide * 100).toFixed(0)}¢)`;
+          else entryFlag = ` (combo ok but side out of range ${minP*100}-${config.strategy.maxPerSide*100}¢)`;
         }
         logger.info(
           `📊 BTC ↑${(btcUp * 100).toFixed(1)}¢ ↓${(btcDown * 100).toFixed(1)}¢ | ` +

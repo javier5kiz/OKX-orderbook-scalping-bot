@@ -29,7 +29,8 @@ module.exports = {
     maxCombinedPrice: 0.80,     // 80¢ combined (e.g., 40¢ + 40¢, or 35¢ + 45¢)
 
     // Per-side max (don't buy if either side is above this even if combined is under 80¢)
-    maxPerSide: 0.45,  // 45¢ max per side — 50¢ has zero edge           // 50¢ max per side
+    maxPerSide: 0.45,  // 45¢ max per side — 50¢ has zero edge
+    minPrice: 0.10,      // 10¢ min per side — below this, order book is empty/unfillable           // 50¢ max per side
 
     // Paper trade size per side (USDT)
     tradeSizeUsdt: 10,          // $10 per side = $20 total per pairs trade
