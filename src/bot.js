@@ -287,6 +287,7 @@ async function runCycle(client) {
 
   // 2. Poll both, look for pairs opportunity
   let entered = false;
+  let attemptMade = false; // HARD LOCK: only one order attempt per cycle, ever
   let btcEntry = 0, ethEntry = 0;
   let btcSide = '', ethSide = '';
   let entryTime = 0;
@@ -294,6 +295,7 @@ async function runCycle(client) {
   let orderResults = null;
 
   while (getSecondsRemaining(interval) > config.strategy.noEntryBeforeEnd) {
+    if (attemptMade) break; // Never place more than one pair per cycle
     const [btcTicker, ethTicker] = await Promise.all([
       client.getEventTicker(btcInstId),
       client.getEventTicker(ethInstId),
@@ -344,6 +346,7 @@ async function runCycle(client) {
 
       if (bestCombo) {
         entered = true;
+        attemptMade = true; // Lock — no more attempts this cycle no matter what happens
         btcEntry = bestCombo.btcPrice;
         ethEntry = bestCombo.ethPrice;
         btcSide = bestCombo.btcSide;
@@ -382,8 +385,27 @@ async function runCycle(client) {
           `Entry: ${entryTime}s`
         );
 
-        // ── PLACE LIVE ORDERS ──────────────────────────────
+        // ── FINAL SANITY CHECK: re-verify live price before firing ──
         if (!config.strategy.dryRun) {
+          const [btcCheck, ethCheck] = await Promise.all([
+            client.getEventTicker(btcInstId),
+            client.getEventTicker(ethInstId),
+          ]);
+          const btcNow = btcSide === 'UP' ? btcCheck?.last : 1 - btcCheck?.last;
+          const ethNow = ethSide === 'UP' ? ethCheck?.last : 1 - ethCheck?.last;
+
+          if (!btcNow || !ethNow || btcNow > config.strategy.maxPerSide || ethNow > config.strategy.maxPerSide || btcNow < config.strategy.minPrice || ethNow < config.strategy.minPrice) {
+            logger.error(
+              `   🚫 ABORT: price moved out of range right before firing | ` +
+              `BTC ${btcSide} now=${((btcNow||0)*100).toFixed(1)}¢ | ETH ${ethSide} now=${((ethNow||0)*100).toFixed(1)}¢`
+            );
+            stats.pairsTrades--;
+            stats.totalInvested -= costTotal;
+            stats.btcLegs.trades--;
+            stats.ethLegs.trades--;
+            break; // No retry — cycle done
+          }
+
           logger.info(`   📤 Placing live orders | sz=${contractSize} per side...`);
           orderResults = await placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize);
           
@@ -393,14 +415,12 @@ async function runCycle(client) {
           
           if (!btcFilled && !ethFilled) {
             // Both orders failed or not filled — don't count as a real trade
-            logger.error(`   💀 Both orders NOT FILLED! Reverting trade.`);
+            logger.error(`   💀 Both orders NOT FILLED! No retry this cycle (hard lock).`);
             stats.pairsTrades--;
             stats.totalInvested -= costTotal;
             stats.btcLegs.trades--;
             stats.ethLegs.trades--;
-            entered = false; // Allow trying again this cycle
-            await sleep(config.strategy.pollIntervalMs);
-            continue;
+            break; // Exit the while loop — do NOT retry, cycle is done
           }
           
           if (btcFilled && !ethFilled) {
