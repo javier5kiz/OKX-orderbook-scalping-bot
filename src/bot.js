@@ -382,9 +382,45 @@ async function runCycle(client) {
           `Entry: ${entryTime}s`
         );
 
-        // ── PLACE LIVE ORDERS ──────────────────────────────
+        // ── CHECK ORDER BOOK LIQUIDITY BEFORE PLACING ──────
         if (!config.strategy.dryRun) {
-          logger.info(`   📤 Placing live orders...`);
+          logger.info(`   📖 Checking order book liquidity...`);
+          
+          const [btcLiq, ethLiq] = await Promise.all([
+            client.checkLiquidity(btcInstId, btcSide, contractSize, config.strategy.maxPerSide),
+            client.checkLiquidity(ethInstId, ethSide, contractSize, config.strategy.maxPerSide),
+          ]);
+          
+          logger.info(
+            `   📊 BTC ${btcSide} liquidity: ${btcLiq.fillable ? '✅' : '❌'} | ` +
+            `best=${(btcLiq.bestPrice * 100).toFixed(1)}¢ size=${btcLiq.totalSize} | ${btcLiq.reason || 'OK'}`
+          );
+          logger.info(
+            `   📊 ETH ${ethSide} liquidity: ${ethLiq.fillable ? '✅' : '❌'} | ` +
+            `best=${(ethLiq.bestPrice * 100).toFixed(1)}¢ size=${ethLiq.totalSize} | ${ethLiq.reason || 'OK'}`
+          );
+          
+          if (!btcLiq.fillable || !ethLiq.fillable) {
+            // Not enough liquidity — skip this entry, don't revert stats
+            logger.warn(
+              `   🚫 SKIP ENTRY: insufficient liquidity | ` +
+              `BTC ${btcSide}: ${btcLiq.fillable ? 'ok' : btcLiq.reason} | ` +
+              `ETH ${ethSide}: ${ethLiq.fillable ? 'ok' : ethLiq.reason}`
+            );
+            stats.pairsTrades--;
+            stats.totalInvested -= costTotal;
+            stats.btcLegs.trades--;
+            stats.ethLegs.trades--;
+            entered = false;
+            await sleep(config.strategy.pollIntervalMs);
+            continue;
+          }
+          
+          // Use actual order book price if available (more accurate than ticker last)
+          if (btcLiq.bestPrice > 0) btcEntry = btcLiq.bestPrice;
+          if (ethLiq.bestPrice > 0) ethEntry = ethLiq.bestPrice;
+          
+          logger.info(`   📤 Placing live orders (liquidity confirmed)...`);
           orderResults = await placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize);
           
           // Check if both orders actually filled

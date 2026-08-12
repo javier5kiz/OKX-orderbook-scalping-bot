@@ -2,6 +2,7 @@
  * okxClient.js — OKX API Client (public market data + private trading)
  * 
  * Event contract outcomes: UP = "yes", DOWN = "no"
+ * Order book liquidity check before placing orders
  */
 
 const crypto = require('crypto');
@@ -90,6 +91,56 @@ class OKXClient {
     };
   }
 
+  // ── PUBLIC: Check liquidity for a specific outcome ─────────
+  // Returns { fillable, bestPrice, totalSize, depth } for the outcome
+  // 
+  // Event contract order book logic:
+  // - asks = sellers of UP (yes) → to buy UP, we hit the asks
+  // - bids = buyers of UP (yes) → to buy DOWN (no), we hit the bids (sell UP = buy DOWN)
+  // - DOWN price = 1 - UP price, so buying DOWN at P means selling UP at (1-P)
+  async checkLiquidity(instId, outcome, minSize, maxPrice) {
+    const book = await this.getOrderBook(instId);
+    if (!book) return { fillable: false, reason: 'no order book', bestPrice: 0, totalSize: 0 };
+
+    let totalSize = 0;
+    let bestPrice = 0;
+    let levels = [];
+
+    if (outcome === 'UP') {
+      // Buying UP: need asks (sellers of UP)
+      // Best ask = lowest ask price
+      for (const ask of book.asks) {
+        if (ask.price <= maxPrice) {
+          totalSize += ask.size;
+          if (bestPrice === 0) bestPrice = ask.price;
+          levels.push({ price: ask.price, size: ask.size, side: 'ask' });
+        }
+      }
+    } else {
+      // Buying DOWN: need bids (buyers of UP = we sell UP to them = buy DOWN)
+      // DOWN price = 1 - UP bid price
+      // We need UP bid price >= (1 - maxPrice) so DOWN price <= maxPrice
+      const minBidPrice = 1 - maxPrice;
+      for (const bid of book.bids) {
+        if (bid.price >= minBidPrice) {
+          totalSize += bid.size;
+          const downPrice = 1 - bid.price;
+          if (bestPrice === 0) bestPrice = downPrice;
+          levels.push({ price: downPrice, upBidPrice: bid.price, size: bid.size, side: 'bid' });
+        }
+      }
+    }
+
+    const fillable = totalSize >= minSize;
+    return {
+      fillable,
+      bestPrice,
+      totalSize,
+      levels: levels.slice(0, 5), // top 5 levels for logging
+      reason: fillable ? '' : `only ${totalSize} available, need ${minSize}`,
+    };
+  }
+
   // ── PUBLIC: Get spot price ─────────────────────────────────
   async getSpotPrice(instId) {
     const res = await this._request('GET', '/api/v5/market/ticker', { instId });
@@ -111,7 +162,7 @@ class OKXClient {
     if (!d) return null;
     return {
       ordId: d.ordId,
-      state: d.state,         // filled, partially_filled, canceled, etc
+      state: d.state,
       fillPx: d.fillPx ? +d.fillPx : 0,
       fillSz: d.fillSz ? +d.fillSz : 0,
       avgPx: d.avgPx ? +d.avgPx : 0,
@@ -122,7 +173,6 @@ class OKXClient {
   }
 
   // ── PRIVATE: Place market order ────────────────────────────
-  // For event contracts: outcome "UP" → "yes", "DOWN" → "no"
   async placeMarketOrder(instId, side, size, outcome) {
     const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
     
@@ -150,9 +200,9 @@ class OKXClient {
       return { ordId: null, errorCode, errorMsg, filled: false, fillPx: 0, fillSz: 0, raw: d };
     }
     
-    // Order accepted — now verify it actually filled
+    // Order accepted — verify it actually filled
     logger.info(`OKX order accepted: ${ordId}, verifying fill...`);
-    await sleep(500); // Brief delay for fill
+    await sleep(500);
     
     const details = await this.getOrderDetails(ordId);
     if (details && details.state === 'filled') {
