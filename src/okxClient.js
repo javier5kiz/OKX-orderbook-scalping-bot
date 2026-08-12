@@ -3,6 +3,8 @@
  * 
  * Public: no API keys needed (tickers, order book)
  * Private: needs API keys for order placement
+ * 
+ * Event contract outcomes: UP = "yes", DOWN = "no"
  */
 
 const crypto = require('crypto');
@@ -50,7 +52,6 @@ class OKXClient {
     const url = this.baseURL + path;
     const bodyStr = body ? JSON.stringify(body) : '';
     
-    // Rate limit
     const gap = Date.now() - this._lastReq;
     if (gap < this._minGap) await sleep(this._minGap - gap);
     this._lastReq = Date.now();
@@ -92,39 +93,34 @@ class OKXClient {
     };
   }
 
-  // ── PUBLIC: Get spot price (BTC-USDT, ETH-USDT) ─────────────
+  // ── PUBLIC: Get spot price ─────────────────────────────────
   async getSpotPrice(instId) {
     const res = await this._request('GET', '/api/v5/market/ticker', { instId });
     const d = res.data?.[0];
     return d?.last ? +d.last : null;
   }
 
-  // ── PUBLIC: Get candle data ─────────────────────────────────
-  async getCandles(instId, bar = '1m', limit = 10) {
-    const res = await this._request('GET', '/api/v5/market/candles', { instId, bar, limit: String(limit) });
-    if (!res.data || res.data.length === 0) return [];
-    return res.data.reverse().map(c => ({
-      ts: parseInt(c[0]), open: +c[1], high: +c[2], low: +c[3], close: +c[4], vol: +c[5],
-    }));
-  }
-
-  // ── PRIVATE: Get balance (needs API keys) ──────────────────
+  // ── PRIVATE: Get balance ───────────────────────────────────
   async getUSDTBalance() {
     const res = await this._request('GET', '/api/v5/account/balance', { ccy: 'USDT' }, null, true);
     const det = res.data?.[0]?.details?.find(d => d.ccy === 'USDT');
     return det ? +det.availBal : 0;
   }
 
-  // ── PRIVATE: Place market order (needs API keys) ────────────
-  // Returns { ordId, errorCode, errorMsg, full } for error logging
+  // ── PRIVATE: Place market order ────────────────────────────
+  // For event contracts: outcome "UP" → "yes", "DOWN" → "no"
+  // OKX API requires outcome as "yes" or "no" per their docs
   async placeMarketOrder(instId, side, size, outcome) {
+    // Map UP/DOWN to OKX's yes/no format
+    const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
+    
     const body = {
       instId,
       tdMode: 'isolated',
       side,
       ordType: 'market',
       sz: String(size),
-      outcome,
+      outcome: okxOutcome,
     };
     
     const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
@@ -134,15 +130,14 @@ class OKXClient {
     const errorCode = d.sCode || res.code || '';
     const errorMsg = d.sMsg || res.msg || '';
     
-    // Log the full response for debugging
     if (!ordId) {
       logger.error(
-        `OKX order FAILED: instId=${instId} side=${side} sz=${size} outcome=${outcome} | ` +
+        `OKX order FAILED: instId=${instId} side=${side} sz=${size} outcome=${okxOutcome} | ` +
         `code=${errorCode} msg=${errorMsg} | full=${JSON.stringify(d)}`
       );
     } else {
       logger.info(
-        `OKX order OK: instId=${instId} side=${side} sz=${size} outcome=${outcome} | ordId=${ordId}`
+        `OKX order OK: instId=${instId} side=${side} sz=${size} outcome=${okxOutcome} | ordId=${ordId}`
       );
     }
     
