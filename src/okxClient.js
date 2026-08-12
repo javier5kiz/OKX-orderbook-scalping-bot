@@ -155,9 +155,11 @@ class OKXClient {
 
   // ── PRIVATE: Get order details (verify fill) ──────────────
   // Try multiple times with longer waits — event contracts may take longer to settle
-  async getOrderDetails(ordId) {
+  async getOrderDetails(ordId, instId) {
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const res = await this._request('GET', '/api/v5/trade/order', { ordId }, null, true);
+      const params = { ordId };
+      if (instId) params.instId = instId;
+      const res = await this._request('GET', '/api/v5/trade/order', params, null, true);
       const d = res.data?.[0];
       
       if (d) {
@@ -220,7 +222,7 @@ class OKXClient {
     logger.info(`OKX order accepted: ${ordId}, verifying fill (2s wait)...`);
     await sleep(2000);
     
-    const details = await this.getOrderDetails(ordId);
+    const details = await this.getOrderDetails(ordId, instId);
     if (details) {
       const state = details.state;
       // Accept any state that means the order executed
