@@ -1,10 +1,13 @@
 /**
- * bot.js — OKX Pairs Divergence Bot (Dry Run)
+ * bot.js — OKX Pairs Divergence Bot (Live + Dry Run)
  * 
  * Strategy: Pairs Divergence
  * Scan BTC + ETH 5-min event contracts simultaneously.
  * Buy opposite sides when combined ≤ 80¢.
  * Profit in 3/4 scenarios.
+ * 
+ * LIVE MODE: places real market orders via OKX API.
+ * DRY RUN: paper trades using last price.
  * 
  * Heartbeat: prints PnL + win rate every 30 seconds.
  */
@@ -54,6 +57,8 @@ const stats = {
   btcLegs: { trades: 0, wins: 0, losses: 0 },
   ethLegs: { trades: 0, wins: 0, losses: 0 },
   startTime: Date.now(),
+  liveOrders: 0,       // Count of real orders placed
+  orderErrors: 0,      // Count of order failures
 };
 
 // ── Live price snapshot (updated every poll) ──────────────────
@@ -77,10 +82,8 @@ function startHeartbeat() {
     const upMin = Math.floor(uptime / 60);
     const upSec = uptime % 60;
 
-    // Count open (unsettled) positions
     const openCount = t - settled;
 
-    // Live price line with per-side check for entry signal
     let priceLine = '';
     if (livePrices.lastUpdate > 0) {
       const combo1 = livePrices.btcUp + livePrices.ethDown;
@@ -88,7 +91,6 @@ function startHeartbeat() {
       const bestCombo = Math.min(combo1, combo2);
       const comboStr = bestCombo > 0 ? (bestCombo * 100).toFixed(1) : '—';
       
-      // Check if best combo would actually pass per-side filter
       const maxPerSide = config.strategy.maxPerSide;
       let bestValid = false;
       let bestSide = '';
@@ -109,15 +111,16 @@ function startHeartbeat() {
     }
 
     const openStr = openCount > 0 ? ` | 🔴 OPEN: ${openCount}` : '';
+    const orderStr = !config.strategy.dryRun ? ` | Orders: ${stats.liveOrders} (errors: ${stats.orderErrors})` : '';
     
     console.log(
       `${logger.COLORS.gray}[${new Date().toLocaleTimeString('en-US', { hour12: false })}]${logger.COLORS.reset} ` +
       `${logger.COLORS.bold}📊 [${upMin}m${upSec}s] ` +
       `Trades: ${t} | W:${wins} L:${stats.totalMiss} | WR: ${wr}% | ` +
-      `PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${openStr}` +
+      `PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${openStr}${orderStr}` +
       `${priceLine}${logger.COLORS.reset}`
     );
-  }, 30000); // every 30 seconds
+  }, 30000);
 }
 
 // ── Print running stats after each trade ──────────────────────
@@ -156,18 +159,21 @@ function printSummary() {
   logger.line(`Pairs trades: ${t}`);
   logger.line(`Both hit: ${stats.bothHit} | One hit: ${stats.oneHit} | Miss: ${stats.totalMiss}`);
   logger.line(`Win rate: ${wr}% (profit in ${wins}/${t} trades)`);
+  if (!config.strategy.dryRun) {
+    logger.line(`Live orders: ${stats.liveOrders} | Order errors: ${stats.orderErrors}`);
+  }
   logger.line('');
-  logger.line(`Invested:  $${stats.totalInvested.toFixed(2)}`);
-  logger.line(`Returned:  $${stats.totalReturned.toFixed(2)}`);
-  logger.line(`Net PnL:   ${sign}$${netPnl.toFixed(2)}`);
+  logger.line(`Invested:  $${stats.totalInvested.toFixed(4)}`);
+  logger.line(`Returned:  $${stats.totalReturned.toFixed(4)}`);
+  logger.line(`Net PnL:   ${sign}$${netPnl.toFixed(4)}`);
   logger.line(`ROI:       ${sign}${roi}%`);
 
   if (stats.bestTrade) {
     logger.line('');
-    logger.line(`🏆 Best:  ${stats.bestTrade.btcSide}/${stats.bestTrade.ethSide} → ${stats.bestTrade.result} → +$${stats.bestTrade.pnl.toFixed(2)}`);
+    logger.line(`🏆 Best:  ${stats.bestTrade.btcSide}/${stats.bestTrade.ethSide} → ${stats.bestTrade.result} → +$${stats.bestTrade.pnl.toFixed(4)}`);
   }
   if (stats.worstTrade) {
-    logger.line(`💀 Worst: ${stats.worstTrade.btcSide}/${stats.worstTrade.ethSide} → ${stats.worstTrade.result} → -$${Math.abs(stats.worstTrade.pnl).toFixed(2)}`);
+    logger.line(`💀 Worst: ${stats.worstTrade.btcSide}/${stats.bestTrade.ethSide} → ${stats.worstTrade.result} → -$${Math.abs(stats.worstTrade.pnl).toFixed(4)}`);
   }
 
   if (stats.tradeHistory.length > 0) {
@@ -179,12 +185,55 @@ function printSummary() {
       logger.line(
         `  ${i + 1}. ${emoji} BTC ${t.btcSide.padEnd(4)} @ ${(t.btcEntry * 100).toFixed(0)}¢ + ` +
         `ETH ${t.ethSide.padEnd(4)} @ ${(t.ethEntry * 100).toFixed(0)}¢ = ${(t.combinedCost * 100).toFixed(0)}¢ → ` +
-        `${t.result} ${s}$${t.pnl.toFixed(2)}`
+        `${t.result} ${s}$${t.pnl.toFixed(4)}`
       );
     });
   }
 
   logger.divider();
+}
+
+// ── Place live orders for both sides ──────────────────────────
+async function placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize) {
+  const results = { btc: null, eth: null, btcError: null, ethError: null };
+
+  // Place BTC order
+  try {
+    const btcOrdId = await client.placeMarketOrder(btcInstId, 'buy', contractSize, btcSide);
+    if (btcOrdId) {
+      results.btc = btcOrdId;
+      stats.liveOrders++;
+      logger.info(`   ✅ BTC ${btcSide} order filled: ${btcOrdId} (${contractSize} contracts)`);
+    } else {
+      results.btcError = 'No order ID returned';
+      stats.orderErrors++;
+      logger.warn(`   ⚠️ BTC ${btcSide} order: no ordId returned`);
+    }
+  } catch (err) {
+    results.btcError = err.message;
+    stats.orderErrors++;
+    logger.error(`   ❌ BTC ${btcSide} order failed: ${err.message}`);
+  }
+
+  // Place ETH order
+  try {
+    const ethOrdId = await client.placeMarketOrder(ethInstId, 'buy', contractSize, ethSide);
+    if (ethOrdId) {
+      results.eth = ethOrdId;
+      stats.liveOrders++;
+      logger.info(`   ✅ ETH ${ethSide} order filled: ${ethOrdId} (${contractSize} contracts)`);
+    } else {
+      results.ethError = 'No order ID returned';
+      stats.orderErrors++;
+      logger.warn(`   ⚠️ ETH ${ethSide} order: no ordId returned`);
+    }
+  } catch (err) {
+    results.ethError = err.message;
+    stats.orderErrors++;
+    logger.error(`   ❌ ETH ${ethSide} order failed: ${err.message}`);
+  }
+
+  return results;
 }
 
 // ── Run one cycle ──────────────────────────────────────────────
@@ -234,6 +283,7 @@ async function runCycle(client) {
   let btcSide = '', ethSide = '';
   let entryTime = 0;
   let pollCount = 0;
+  let orderResults = null;
 
   while (getSecondsRemaining(interval) > config.strategy.noEntryBeforeEnd) {
     const [btcTicker, ethTicker] = await Promise.all([
@@ -292,34 +342,59 @@ async function runCycle(client) {
         ethSide = bestCombo.ethSide;
         entryTime = getSecondsIntoCycle(interval);
 
+        const contractSize = config.strategy.contractSize;
         const combinedCost = btcEntry + ethEntry;
-        const costUsd = config.strategy.tradeSizeUsdt * 2;
-        const btcContracts = config.strategy.tradeSizeUsdt / btcEntry;
-        const ethContracts = config.strategy.tradeSizeUsdt / ethEntry;
-        const maxPayout = btcContracts + ethContracts;
-        const oneWinPayout = Math.max(btcContracts, ethContracts);
+        // Cost = contractSize × price per side, total = both sides
+        const btcCost = contractSize * btcEntry;
+        const ethCost = contractSize * ethEntry;
+        const costTotal = btcCost + ethCost;
+        // Payout if side wins = contractSize × $1 per contract
+        const btcPayout = contractSize;   // if BTC wins: contractSize × $1
+        const ethPayout = contractSize;   // if ETH wins: contractSize × $1
+        const maxPayout = btcPayout + ethPayout;     // both win
+        const oneWinPayout = Math.max(btcPayout, ethPayout); // one wins
 
         stats.pairsTrades++;
-        stats.totalInvested += costUsd;
+        stats.totalInvested += costTotal;
         stats.btcLegs.trades++;
         stats.ethLegs.trades++;
 
+        const modeLabel = config.strategy.dryRun ? '[DRY]' : '[LIVE]';
         logger.enter(
-          `${logger.COLORS.bold}🎯 PAIRS ENTRY: BTC ${btcSide} @ ${(btcEntry * 100).toFixed(1)}¢ + ` +
+          `${logger.COLORS.bold}${modeLabel} 🎯 PAIRS ENTRY: BTC ${btcSide} @ ${(btcEntry * 100).toFixed(1)}¢ + ` +
           `ETH ${ethSide} @ ${(ethEntry * 100).toFixed(1)}¢ = ${(combinedCost * 100).toFixed(1)}¢ combined${logger.COLORS.reset}`
         );
         logger.info(
-          `   BTC ${btcSide}: $${config.strategy.tradeSizeUsdt} → ${btcContracts.toFixed(1)} contracts | ` +
-          `ETH ${ethSide}: $${config.strategy.tradeSizeUsdt} → ${ethContracts.toFixed(1)} contracts`
+          `   BTC ${btcSide}: ${contractSize} contracts @ $${btcEntry.toFixed(2)} = $${btcCost.toFixed(4)} | ` +
+          `ETH ${ethSide}: ${contractSize} contracts @ $${ethEntry.toFixed(2)} = $${ethCost.toFixed(4)}`
         );
         logger.info(
-          `   Cost: $${costUsd} | Both win: +$${(maxPayout - costUsd).toFixed(2)} | ` +
-          `One win: +$${(oneWinPayout - costUsd).toFixed(2)} | Both lose: -$${costUsd} | ` +
+          `   Cost: $${costTotal.toFixed(4)} | Both win: +$${(maxPayout - costTotal).toFixed(4)} | ` +
+          `One win: +$${(oneWinPayout - costTotal).toFixed(4)} | Both lose: -$${costTotal.toFixed(4)} | ` +
           `Entry: ${entryTime}s`
         );
+
+        // ── PLACE LIVE ORDERS ──────────────────────────────
+        if (!config.strategy.dryRun) {
+          logger.info(`   📤 Placing live orders...`);
+          orderResults = await placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize);
+          
+          if (orderResults.btcError && orderResults.ethError) {
+            // Both orders failed — don't count as a real trade
+            logger.error(`   💀 Both orders failed! Reverting trade.`);
+            stats.pairsTrades--;
+            stats.totalInvested -= costTotal;
+            stats.btcLegs.trades--;
+            stats.ethLegs.trades--;
+            entered = false; // Allow trying again this cycle
+            await sleep(config.strategy.pollIntervalMs);
+            continue;
+          }
+        } else {
+          logger.info(`   📝 [DRY RUN] No real orders placed`);
+        }
       } else if (pollCount === 0 || pollCount % 5 === 0) {
         const bestOpp = Math.min(btcUp + ethDown, btcDown + ethUp);
-        // Check per-side limits for display
         let entryFlag = ' (>80¢)';
         if (bestOpp <= config.strategy.maxCombinedPrice) {
           const minP = config.strategy.minPrice || 0.10;
@@ -370,26 +445,27 @@ async function runCycle(client) {
 
   // 6. Track result
   if (entered) {
-    const costUsd = config.strategy.tradeSizeUsdt * 2;
-    const btcContracts = config.strategy.tradeSizeUsdt / btcEntry;
-    const ethContracts = config.strategy.tradeSizeUsdt / ethEntry;
+    const contractSize = config.strategy.contractSize;
+    const btcCost = contractSize * btcEntry;
+    const ethCost = contractSize * ethEntry;
+    const costTotal = btcCost + ethCost;
 
     let btcPayout = 0, ethPayout = 0;
     let btcResult = 'LOSS', ethResult = 'LOSS';
 
     if (btcWinner === btcSide) {
-      btcPayout = btcContracts;
+      btcPayout = contractSize; // contractSize × $1
       btcResult = 'WIN';
       stats.btcLegs.wins++;
     }
     if (ethWinner === ethSide) {
-      ethPayout = ethContracts;
+      ethPayout = contractSize;
       ethResult = 'WIN';
       stats.ethLegs.wins++;
     }
 
     const totalPayout = btcPayout + ethPayout;
-    const pnl = totalPayout - costUsd;
+    const pnl = totalPayout - costTotal;
     const combinedCost = btcEntry + ethEntry;
 
     let result, emoji;
@@ -399,7 +475,7 @@ async function runCycle(client) {
       stats.bothHit++;
       logger.win(
         `${emoji} BTC ${btcSide} ✅ + ETH ${ethSide} ✅ → BOTH HIT | ` +
-        `+$${pnl.toFixed(2)} (paid $${costUsd}, got $${totalPayout.toFixed(2)})`
+        `+$${pnl.toFixed(4)} (paid $${costTotal.toFixed(4)}, got $${totalPayout.toFixed(4)})`
       );
     } else if (btcResult === 'WIN' || ethResult === 'WIN') {
       result = 'ONE HIT';
@@ -409,7 +485,7 @@ async function runCycle(client) {
       const loseSide = btcResult === 'LOSS' ? `BTC ${btcSide}` : `ETH ${ethSide}`;
       logger.info(
         `${emoji} ${winSide} won, ${loseSide} lost → ONE HIT | ` +
-        `+${pnl.toFixed(2)} (paid $${costUsd}, got $${totalPayout.toFixed(2)})`
+        `+${pnl.toFixed(4)} (paid $${costTotal.toFixed(4)}, got $${totalPayout.toFixed(4)})`
       );
     } else {
       result = 'MISS';
@@ -417,7 +493,7 @@ async function runCycle(client) {
       stats.totalMiss++;
       logger.loss(
         `${emoji} BTC ${btcSide} ❌ + ETH ${ethSide} ❌ → BOTH MISSED | ` +
-        `-$${costUsd} (winners were BTC ${btcWinner}, ETH ${ethWinner})`
+        `-$${costTotal.toFixed(4)} (winners were BTC ${btcWinner}, ETH ${ethWinner})`
       );
     }
 
@@ -429,7 +505,9 @@ async function runCycle(client) {
       btcSide, ethSide, btcEntry, ethEntry, combinedCost,
       btcOpen, ethOpen, btcSettle, ethSettle,
       btcWinner, ethWinner, btcResult, ethResult,
-      result, pnl, cost: costUsd, payout: totalPayout,
+      result, pnl, cost: costTotal, payout: totalPayout,
+      contractSize,
+      liveOrders: orderResults,
     };
     stats.tradeHistory.push(record);
     if (stats.tradeHistory.length > 200) stats.tradeHistory.shift();
@@ -445,19 +523,51 @@ async function runCycle(client) {
 
 // ── Main ──────────────────────────────────────────────────────
 async function main() {
-  const mode = config.strategy.dryRun ? 'DRY RUN (paper trading)' : 'LIVE (real money)';
+  const dryRun = config.strategy.dryRun;
+  const mode = dryRun ? 'DRY RUN (paper trading)' : '🔴 LIVE (real money)';
+  const contractSize = config.strategy.contractSize;
 
   logger.banner('OKX PAIRS DIVERGENCE BOT');
   logger.info(`Mode: ${mode}`);
+  logger.info(`Contract size: ${contractSize} per side (${contractSize * 2} total per pair)`);
   logger.info(`Strategy: BTC side + ETH opposite side ≤ ${(config.strategy.maxCombinedPrice * 100).toFixed(0)}¢ combined`);
   logger.info(`Markets: BTC 5min + ETH 5min (polled simultaneously)`);
-  logger.info(`Trade size: $${config.strategy.tradeSizeUsdt} per side ($${config.strategy.tradeSizeUsdt * 2} per pair)`);
-  logger.info(`Max per side: ${(config.strategy.maxPerSide * 100).toFixed(0)}¢`);
+  logger.info(`Filters: ${config.strategy.minPrice * 100}¢-${config.strategy.maxPerSide * 100}¢ per side | ≤ ${(config.strategy.maxCombinedPrice * 100).toFixed(0)}¢ combined`);
   logger.info(`Profit in 3/4 scenarios — only lose when BTC & ETH move same direction`);
   logger.info(`Heartbeat: PnL + win rate every 30 seconds`);
   logger.divider();
 
   const client = new OKXClient(config.okx);
+
+  // ── Live mode: verify API keys and check balance ──────────
+  if (!dryRun) {
+    if (!config.okx.apiKey || !config.okx.secretKey || !config.okx.passphrase) {
+      logger.error('❌ API keys not configured! Set OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE env vars.');
+      logger.error('   Cannot start in LIVE mode without API keys.');
+      process.exit(1);
+    }
+    logger.info('🔑 API keys detected. Checking balance...');
+    try {
+      const balance = await client.getUSDTBalance();
+      logger.info(`💰 Account USDT balance: $${balance.toFixed(2)}`);
+      if (balance <= 0) {
+        logger.error('❌ Account balance is $0. Fund your OKX account to start trading.');
+        logger.error('   Minimum recommended: $10 USDT for 0.1 contract testing.');
+        process.exit(1);
+      }
+      const maxLossPerTrade = contractSize * config.strategy.maxCombinedPrice;
+      const tradesPossible = balance / maxLossPerTrade;
+      logger.info(`   Max loss per trade: $${maxLossPerTrade.toFixed(4)} | Trades possible: ~${Math.floor(tradesPossible)}`);
+      if (tradesPossible < 10) {
+        logger.warn(`⚠️ Low balance — only ~${Math.floor(tradesPossible)} trades possible. Consider funding more.`);
+      }
+    } catch (err) {
+      logger.error(`❌ Could not check balance: ${err.message}`);
+      logger.error('   Check that API keys are valid and have trading permissions.');
+      process.exit(1);
+    }
+    logger.divider();
+  }
 
   // Keep-alive HTTP server
   const http = require('http');
@@ -466,26 +576,24 @@ async function main() {
     const t = stats.pairsTrades;
     const wr = t > 0 ? (((stats.bothHit + stats.oneHit) / t) * 100).toFixed(1) : '0';
     const pnl = stats.totalReturned - stats.totalInvested;
+    const mode = config.strategy.dryRun ? 'DRY' : 'LIVE';
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(
-      `Pairs Divergence Bot | Cycles: ${stats.cycles} | Pairs: ${t} | ` +
+      `Pairs Divergence Bot [${mode}] | Cycles: ${stats.cycles} | Pairs: ${t} | ` +
       `Both: ${stats.bothHit} | One: ${stats.oneHit} | Miss: ${stats.totalMiss} | ` +
-      `WR: ${wr}% | PnL: $${pnl.toFixed(2)}`
+      `WR: ${wr}% | PnL: $${pnl.toFixed(4)}` +
+      (!config.strategy.dryRun ? ` | Orders: ${stats.liveOrders} | Errors: ${stats.orderErrors}` : '')
     );
   }).listen(port, () => logger.info(`Keep-alive on :${port}`));
 
   logger.info('🚀 Bot started. Scanning BTC + ETH event contracts...\n');
 
-  // Start 30-second heartbeat
   startHeartbeat();
 
   while (true) {
     try {
       await runCycle(client);
-
-      if (stats.cycles % 5 === 0) {
-        printSummary();
-      }
+      if (stats.cycles % 5 === 0) printSummary();
     } catch (err) {
       logger.error(`Cycle error: ${err.message}`);
       await sleep(5000);
