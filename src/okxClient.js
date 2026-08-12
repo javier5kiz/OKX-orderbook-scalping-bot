@@ -154,20 +154,35 @@ class OKXClient {
   }
 
   // ── PRIVATE: Get order details (verify fill) ──────────────
+  // Try multiple times with longer waits — event contracts may take longer to settle
   async getOrderDetails(ordId) {
-    const res = await this._request('GET', '/api/v5/trade/order', { ordId }, null, true);
-    const d = res.data?.[0];
-    if (!d) return null;
-    return {
-      ordId: d.ordId,
-      state: d.state,
-      fillPx: d.fillPx ? +d.fillPx : 0,
-      fillSz: d.fillSz ? +d.fillSz : 0,
-      avgPx: d.avgPx ? +d.avgPx : 0,
-      instId: d.instId,
-      side: d.side,
-      sz: d.sz ? +d.sz : 0,
-    };
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await this._request('GET', '/api/v5/trade/order', { ordId }, null, true);
+      const d = res.data?.[0];
+      
+      if (d) {
+        return {
+          ordId: d.ordId,
+          state: d.state,
+          fillPx: d.fillPx ? +d.fillPx : 0,
+          fillSz: d.fillSz ? +d.fillSz : 0,
+          avgPx: d.avgPx ? +d.avgPx : 0,
+          instId: d.instId,
+          side: d.side,
+          sz: d.sz ? +d.sz : 0,
+        };
+      }
+      
+      // Log raw response on first attempt for debugging
+      if (attempt === 1) {
+        logger.info(`   Order check attempt ${attempt}: raw response code=${res.code} msg=${res.msg} dataLen=${res.data?.length || 0}`);
+      }
+      
+      if (attempt < 3) await sleep(1000); // Wait 1s between retries
+    }
+    
+    logger.warn(`   Order ${ordId}: could not get details after 3 attempts`);
+    return null;
   }
 
   // ── PRIVATE: Place market order ────────────────────────────
@@ -201,24 +216,35 @@ class OKXClient {
       return { ordId: null, errorCode, errorMsg, filled: false, fillPx: 0, fillSz: 0, raw: d };
     }
     
-    // Order accepted — verify it actually filled
-    logger.info(`OKX order accepted: ${ordId}, verifying fill...`);
-    await sleep(500);
+    // Order accepted — verify it actually filled (wait 2s, then check with retries)
+    logger.info(`OKX order accepted: ${ordId}, verifying fill (2s wait)...`);
+    await sleep(2000);
     
     const details = await this.getOrderDetails(ordId);
-    if (details && details.state === 'filled') {
-      logger.info(
-        `✅ FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
-        `fillPx=${details.fillPx} fillSz=${details.fillSz} state=${details.state}`
-      );
-      return { ordId, errorCode: '', errorMsg: '', filled: true, fillPx: details.fillPx, fillSz: details.fillSz, raw: d };
+    if (details) {
+      const state = details.state;
+      // Accept any state that means the order executed
+      const isFilled = ['filled', 'partially_filled', 'effective'].includes(state);
+      
+      if (isFilled) {
+        logger.info(
+          `✅ FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
+          `state=${state} fillPx=${details.fillPx} fillSz=${details.fillSz}`
+        );
+        return { ordId, errorCode: '', errorMsg: '', filled: true, fillPx: details.fillPx, fillSz: details.fillSz, raw: d };
+      } else {
+        logger.warn(
+          `⚠️ NOT FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
+          `state=${state} fillSz=${details.fillSz}`
+        );
+        return { ordId, errorCode: 'not_filled', errorMsg: `Order state: ${state}`, filled: false, fillPx: details.fillPx, fillSz: details.fillSz, raw: d };
+      }
     } else {
-      const state = details?.state || 'unknown';
       logger.warn(
-        `⚠️ NOT FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
-        `state=${state} fillSz=${details?.fillSz || 0}`
+        `⚠️ UNVERIFIABLE: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
+        `could not retrieve order details after 3 attempts`
       );
-      return { ordId, errorCode: 'not_filled', errorMsg: `Order state: ${state}`, filled: false, fillPx: details?.fillPx || 0, fillSz: details?.fillSz || 0, raw: d };
+      return { ordId, errorCode: 'unverifiable', errorMsg: 'Could not verify fill', filled: false, fillPx: 0, fillSz: 0, raw: d };
     }
   }
 }
