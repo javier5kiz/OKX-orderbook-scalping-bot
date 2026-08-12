@@ -199,15 +199,15 @@ async function placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, c
 
   // Place BTC order
   try {
-    const btcOrdId = await client.placeMarketOrder(btcInstId, 'buy', contractSize, btcSide);
-    if (btcOrdId) {
-      results.btc = btcOrdId;
+    const btcRes = await client.placeMarketOrder(btcInstId, 'buy', contractSize, btcSide);
+    if (btcRes.ordId) {
+      results.btc = btcRes.ordId;
       stats.liveOrders++;
-      logger.info(`   ✅ BTC ${btcSide} order filled: ${btcOrdId} (${contractSize} contracts)`);
+      logger.info(`   ✅ BTC ${btcSide} order filled: ${btcRes.ordId} (${contractSize} contracts)`);
     } else {
-      results.btcError = 'No order ID returned';
+      results.btcError = btcRes.errorMsg || 'No order ID returned';
       stats.orderErrors++;
-      logger.warn(`   ⚠️ BTC ${btcSide} order: no ordId returned`);
+      logger.warn(`   ⚠️ BTC ${btcSide} order failed: ${btcRes.errorMsg} (code: ${btcRes.errorCode})`);
     }
   } catch (err) {
     results.btcError = err.message;
@@ -217,15 +217,15 @@ async function placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, c
 
   // Place ETH order
   try {
-    const ethOrdId = await client.placeMarketOrder(ethInstId, 'buy', contractSize, ethSide);
-    if (ethOrdId) {
-      results.eth = ethOrdId;
+    const ethRes = await client.placeMarketOrder(ethInstId, 'buy', contractSize, ethSide);
+    if (ethRes.ordId) {
+      results.eth = ethRes.ordId;
       stats.liveOrders++;
-      logger.info(`   ✅ ETH ${ethSide} order filled: ${ethOrdId} (${contractSize} contracts)`);
+      logger.info(`   ✅ ETH ${ethSide} order filled: ${ethRes.ordId} (${contractSize} contracts)`);
     } else {
-      results.ethError = 'No order ID returned';
+      results.ethError = ethRes.errorMsg || 'No order ID returned';
       stats.orderErrors++;
-      logger.warn(`   ⚠️ ETH ${ethSide} order: no ordId returned`);
+      logger.warn(`   ⚠️ ETH ${ethSide} order failed: ${ethRes.errorMsg} (code: ${ethRes.errorCode})`);
     }
   } catch (err) {
     results.ethError = err.message;

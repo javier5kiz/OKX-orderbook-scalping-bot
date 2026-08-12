@@ -1,8 +1,8 @@
 /**
- * okxClient.js — OKX API Client (public market data + optional private)
+ * okxClient.js — OKX API Client (public market data + private trading)
  * 
- * For dry-run mode: only uses public endpoints (no API keys needed)
- * For live mode: needs API keys for order placement
+ * Public: no API keys needed (tickers, order book)
+ * Private: needs API keys for order placement
  */
 
 const crypto = require('crypto');
@@ -59,19 +59,13 @@ class OKXClient {
       const headers = this._headers(method, path, bodyStr, isPrivate);
       const res = await fetch(url, { method, headers, body: bodyStr || undefined });
       const json = await res.json();
-      if (json.code && json.code !== '0') {
-        logger.debug(`OKX: ${method} ${endpoint} → code=${json.code} msg=${json.msg}`);
-      }
       return json;
     } catch (err) {
-      logger.debug(`OKX error: ${method} ${endpoint} → ${err.message}`);
       return { code: '-1', msg: err.message, data: [] };
     }
   }
 
   // ── PUBLIC: Get event contract ticker ──────────────────────
-  // Returns { last, bidPx, askPx, bidSz, askSz } for the UP outcome
-  // UP price = last, DOWN price = 1 - last
   async getEventTicker(instId) {
     const res = await this._request('GET', '/api/v5/market/ticker', { instId });
     const d = res.data?.[0];
@@ -122,10 +116,37 @@ class OKXClient {
   }
 
   // ── PRIVATE: Place market order (needs API keys) ────────────
+  // Returns { ordId, errorCode, errorMsg, full } for error logging
   async placeMarketOrder(instId, side, size, outcome) {
-    const body = { instId, tdMode: 'isolated', side, ordType: 'market', sz: String(size), outcome };
+    const body = {
+      instId,
+      tdMode: 'isolated',
+      side,
+      ordType: 'market',
+      sz: String(size),
+      outcome,
+    };
+    
     const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
-    return res?.data?.[0]?.ordId || null;
+    
+    const d = res?.data?.[0] || {};
+    const ordId = d.ordId || null;
+    const errorCode = d.sCode || res.code || '';
+    const errorMsg = d.sMsg || res.msg || '';
+    
+    // Log the full response for debugging
+    if (!ordId) {
+      logger.error(
+        `OKX order FAILED: instId=${instId} side=${side} sz=${size} outcome=${outcome} | ` +
+        `code=${errorCode} msg=${errorMsg} | full=${JSON.stringify(d)}`
+      );
+    } else {
+      logger.info(
+        `OKX order OK: instId=${instId} side=${side} sz=${size} outcome=${outcome} | ordId=${ordId}`
+      );
+    }
+    
+    return { ordId, errorCode, errorMsg, raw: d };
   }
 }
 
