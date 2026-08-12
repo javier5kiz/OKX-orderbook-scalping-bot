@@ -352,8 +352,17 @@ async function runCycle(client) {
         btcSide = bestCombo.btcSide;
         ethSide = bestCombo.ethSide;
         entryTime = getSecondsIntoCycle(interval);
+        let tradeContractSize = 0; // will be set when orders are placed
 
-        const contractSize = config.strategy.contractSize;
+        // ── DYNAMIC CONTRACT SIZE: 5% of balance per side ──
+        const balance = await client.getUSDTBalance();
+        const riskPerSide = config.strategy.riskPerSide || 0.05;
+        const maxSpendPerSide = balance * riskPerSide;
+        // Contract size = spend / price (e.g. $0.0445 / 0.40 = 0.11 contracts)
+        const btcContractSize = Math.max(config.strategy.minContractSize || 0.01, +(maxSpendPerSide / btcEntry).toFixed(2));
+        const ethContractSize = Math.max(config.strategy.minContractSize || 0.01, +(maxSpendPerSide / ethEntry).toFixed(2));
+        const contractSize = Math.min(btcContractSize, ethContractSize); // use smaller to be safe
+        tradeContractSize = contractSize; // store for settlement
         const combinedCost = btcEntry + ethEntry;
         // Cost = contractSize × price per side, total = both sides
         const btcCost = contractSize * btcEntry;
@@ -374,6 +383,10 @@ async function runCycle(client) {
         logger.enter(
           `${logger.COLORS.bold}${modeLabel} 🎯 PAIRS ENTRY: BTC ${btcSide} @ ${(btcEntry * 100).toFixed(1)}¢ + ` +
           `ETH ${ethSide} @ ${(ethEntry * 100).toFixed(1)}¢ = ${(combinedCost * 100).toFixed(1)}¢ combined${logger.COLORS.reset}`
+        );
+        logger.info(
+          `   💰 Balance: $${balance.toFixed(2)} | 5% per side: $${maxSpendPerSide.toFixed(4)} | ` +
+          `Contract size: ${contractSize} (BTC: ${btcContractSize} @ ${(btcEntry*100).toFixed(0)}¢, ETH: ${ethContractSize} @ ${(ethEntry*100).toFixed(0)}¢)`
         );
         logger.info(
           `   BTC ${btcSide}: ${contractSize} contracts @ $${btcEntry.toFixed(2)} = $${btcCost.toFixed(4)} | ` +
@@ -486,7 +499,7 @@ async function runCycle(client) {
 
   // 6. Track result
   if (entered) {
-    const contractSize = config.strategy.contractSize;
+    const contractSize = tradeContractSize || 0.1; // fallback if not set
     const btcCost = contractSize * btcEntry;
     const ethCost = contractSize * ethEntry;
     const costTotal = btcCost + ethCost;

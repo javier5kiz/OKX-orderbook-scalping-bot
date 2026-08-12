@@ -2,7 +2,7 @@
  * config.js — OKX Pairs Divergence Bot Configuration
  * 
  * LIVE MODE: places real orders on OKX using API keys.
- * Change contractSize to scale position sizes.
+ * Position sizing: dynamic 5% of account balance per side.
  */
 
 module.exports = {
@@ -23,13 +23,15 @@ module.exports = {
     dryRun: false,
 
     // ════════════════════════════════════════════════════════
-    // CONTRACT SIZE — change this to scale up:
-    //   0.1 = minimum OKX size (~$0.05/trade at 50¢ avg)
-    //   1   = small (~$0.50/trade)
-    //   10  = medium (~$5/trade)
-    //   100 = large (~$50/trade)
+    // POSITION SIZING — dynamic based on account balance
+    //   riskPerSide: 0.05 = 5% of balance per order (10% total per pair)
+    //   Bot fetches balance each cycle and calculates:
+    //   contractSize = (balance * riskPerSide) / entryPrice
+    //   e.g. $0.89 balance, 40¢ entry → 0.0445/0.40 = 0.11 contracts
+    //   e.g. $0.89 balance, 30¢ entry → 0.0445/0.30 = 0.15 contracts
     // ════════════════════════════════════════════════════════
-    contractSize: 0.1,
+    riskPerSide: 0.05,  // 5% of balance per side
+    minContractSize: 0.01,  // minimum contract size (OKX minimum)
 
     maxCombinedPrice: 0.80,
     maxPerSide: 0.45,
