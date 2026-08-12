@@ -1,9 +1,6 @@
 /**
  * okxClient.js — OKX API Client (public market data + private trading)
  * 
- * Public: no API keys needed (tickers, order book)
- * Private: needs API keys for order placement
- * 
  * Event contract outcomes: UP = "yes", DOWN = "no"
  */
 
@@ -20,7 +17,7 @@ class OKXClient {
     this.isDemo = cfg.isDemo || false;
     this.baseURL = cfg.baseURL || 'https://www.okx.com';
     this._lastReq = 0;
-    this._minGap = 120; // ms between requests
+    this._minGap = 120;
   }
 
   _sign(timestamp, method, path, body = '') {
@@ -107,11 +104,26 @@ class OKXClient {
     return det ? +det.availBal : 0;
   }
 
+  // ── PRIVATE: Get order details (verify fill) ──────────────
+  async getOrderDetails(ordId) {
+    const res = await this._request('GET', '/api/v5/trade/order', { ordId }, null, true);
+    const d = res.data?.[0];
+    if (!d) return null;
+    return {
+      ordId: d.ordId,
+      state: d.state,         // filled, partially_filled, canceled, etc
+      fillPx: d.fillPx ? +d.fillPx : 0,
+      fillSz: d.fillSz ? +d.fillSz : 0,
+      avgPx: d.avgPx ? +d.avgPx : 0,
+      instId: d.instId,
+      side: d.side,
+      sz: d.sz ? +d.sz : 0,
+    };
+  }
+
   // ── PRIVATE: Place market order ────────────────────────────
   // For event contracts: outcome "UP" → "yes", "DOWN" → "no"
-  // OKX API requires outcome as "yes" or "no" per their docs
   async placeMarketOrder(instId, side, size, outcome) {
-    // Map UP/DOWN to OKX's yes/no format
     const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
     
     const body = {
@@ -135,13 +147,28 @@ class OKXClient {
         `OKX order FAILED: instId=${instId} side=${side} sz=${size} outcome=${okxOutcome} | ` +
         `code=${errorCode} msg=${errorMsg} | full=${JSON.stringify(d)}`
       );
-    } else {
-      logger.info(
-        `OKX order OK: instId=${instId} side=${side} sz=${size} outcome=${okxOutcome} | ordId=${ordId}`
-      );
+      return { ordId: null, errorCode, errorMsg, filled: false, fillPx: 0, fillSz: 0, raw: d };
     }
     
-    return { ordId, errorCode, errorMsg, raw: d };
+    // Order accepted — now verify it actually filled
+    logger.info(`OKX order accepted: ${ordId}, verifying fill...`);
+    await sleep(500); // Brief delay for fill
+    
+    const details = await this.getOrderDetails(ordId);
+    if (details && details.state === 'filled') {
+      logger.info(
+        `✅ FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
+        `fillPx=${details.fillPx} fillSz=${details.fillSz} state=${details.state}`
+      );
+      return { ordId, errorCode: '', errorMsg: '', filled: true, fillPx: details.fillPx, fillSz: details.fillSz, raw: d };
+    } else {
+      const state = details?.state || 'unknown';
+      logger.warn(
+        `⚠️ NOT FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
+        `state=${state} fillSz=${details?.fillSz || 0}`
+      );
+      return { ordId, errorCode: 'not_filled', errorMsg: `Order state: ${state}`, filled: false, fillPx: details?.fillPx || 0, fillSz: details?.fillSz || 0, raw: d };
+    }
   }
 }
 

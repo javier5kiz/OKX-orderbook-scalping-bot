@@ -200,17 +200,21 @@ async function placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, c
   // Place BTC order
   try {
     const btcRes = await client.placeMarketOrder(btcInstId, 'buy', contractSize, btcSide);
-    if (btcRes.ordId) {
+    if (btcRes.filled) {
       results.btc = btcRes.ordId;
+      results.btcFilled = true;
+      results.btcFillPx = btcRes.fillPx;
       stats.liveOrders++;
-      logger.info(`   ✅ BTC ${btcSide} order filled: ${btcRes.ordId} (${contractSize} contracts)`);
+      logger.info(`   ✅ BTC ${btcSide} FILLED: ${btcRes.ordId} | price=${btcRes.fillPx} | sz=${btcRes.fillSz}`);
     } else {
-      results.btcError = btcRes.errorMsg || 'No order ID returned';
+      results.btcError = btcRes.errorMsg || 'Order not filled';
+      results.btcFilled = false;
       stats.orderErrors++;
-      logger.warn(`   ⚠️ BTC ${btcSide} order failed: ${btcRes.errorMsg} (code: ${btcRes.errorCode})`);
+      logger.warn(`   ⚠️ BTC ${btcSide} NOT FILLED: ${btcRes.errorMsg} (ordId: ${btcRes.ordId || 'none'})`);
     }
   } catch (err) {
     results.btcError = err.message;
+    results.btcFilled = false;
     stats.orderErrors++;
     logger.error(`   ❌ BTC ${btcSide} order failed: ${err.message}`);
   }
@@ -218,17 +222,21 @@ async function placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, c
   // Place ETH order
   try {
     const ethRes = await client.placeMarketOrder(ethInstId, 'buy', contractSize, ethSide);
-    if (ethRes.ordId) {
+    if (ethRes.filled) {
       results.eth = ethRes.ordId;
+      results.ethFilled = true;
+      results.ethFillPx = ethRes.fillPx;
       stats.liveOrders++;
-      logger.info(`   ✅ ETH ${ethSide} order filled: ${ethRes.ordId} (${contractSize} contracts)`);
+      logger.info(`   ✅ ETH ${ethSide} FILLED: ${ethRes.ordId} | price=${ethRes.fillPx} | sz=${ethRes.fillSz}`);
     } else {
-      results.ethError = ethRes.errorMsg || 'No order ID returned';
+      results.ethError = ethRes.errorMsg || 'Order not filled';
+      results.ethFilled = false;
       stats.orderErrors++;
-      logger.warn(`   ⚠️ ETH ${ethSide} order failed: ${ethRes.errorMsg} (code: ${ethRes.errorCode})`);
+      logger.warn(`   ⚠️ ETH ${ethSide} NOT FILLED: ${ethRes.errorMsg} (ordId: ${ethRes.ordId || 'none'})`);
     }
   } catch (err) {
     results.ethError = err.message;
+    results.ethFilled = false;
     stats.orderErrors++;
     logger.error(`   ❌ ETH ${ethSide} order failed: ${err.message}`);
   }
@@ -379,9 +387,13 @@ async function runCycle(client) {
           logger.info(`   📤 Placing live orders...`);
           orderResults = await placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize);
           
-          if (orderResults.btcError && orderResults.ethError) {
-            // Both orders failed — don't count as a real trade
-            logger.error(`   💀 Both orders failed! Reverting trade.`);
+          // Check if both orders actually filled
+          const btcFilled = orderResults.btcFilled;
+          const ethFilled = orderResults.ethFilled;
+          
+          if (!btcFilled && !ethFilled) {
+            // Both orders failed or not filled — don't count as a real trade
+            logger.error(`   💀 Both orders NOT FILLED! Reverting trade.`);
             stats.pairsTrades--;
             stats.totalInvested -= costTotal;
             stats.btcLegs.trades--;
@@ -389,6 +401,15 @@ async function runCycle(client) {
             entered = false; // Allow trying again this cycle
             await sleep(config.strategy.pollIntervalMs);
             continue;
+          }
+          
+          if (btcFilled && !ethFilled) {
+            // Only BTC filled — log partial fill warning
+            logger.warn(`   ⚠️ PARTIAL: BTC filled but ETH did not. Continuing with BTC only.`);
+          }
+          if (!btcFilled && ethFilled) {
+            // Only ETH filled — log partial fill warning
+            logger.warn(`   ⚠️ PARTIAL: ETH filled but BTC did not. Continuing with ETH only.`);
           }
         } else {
           logger.info(`   📝 [DRY RUN] No real orders placed`);
