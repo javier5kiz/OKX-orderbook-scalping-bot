@@ -2,7 +2,7 @@
  * okxClient.js — OKX API Client (public market data + private trading)
  * 
  * Event contract outcomes: UP = "yes", DOWN = "no"
- * Order book liquidity check before placing orders
+ * Liquidity check uses ticker bid/ask sizes (already polled every 3s)
  */
 
 const crypto = require('crypto');
@@ -65,6 +65,7 @@ class OKXClient {
   }
 
   // ── PUBLIC: Get event contract ticker ──────────────────────
+  // Returns ticker with bid/ask for liquidity check
   async getEventTicker(instId) {
     const res = await this._request('GET', '/api/v5/market/ticker', { instId });
     const d = res.data?.[0];
@@ -79,7 +80,54 @@ class OKXClient {
     };
   }
 
-  // ── PUBLIC: Get order book ──────────────────────────────────
+  // ── PUBLIC: Check liquidity using ticker data ──────────────
+  // Uses the ticker's bid/ask sizes to check if there are sellers
+  //
+  // For event contracts:
+  // - Ticker shows UP (yes) market: askPx = sell UP price, bidPx = buy UP price
+  // - To buy UP (yes): need askSz > 0 (sellers of UP at askPx)
+  // - To buy DOWN (no): need bidSz > 0 (buyers of UP at bidPx; DOWN price = 1 - bidPx)
+  //
+  // ticker = the ticker we already polled (no extra API call needed)
+  // outcome = 'UP' or 'DOWN'
+  // minSize = contract size we need (e.g., 0.1)
+  // maxPrice = max price per side (e.g., 0.45)
+  checkLiquidityFromTicker(ticker, outcome, minSize, maxPrice) {
+    if (!ticker || !ticker.last) {
+      return { fillable: false, reason: 'no ticker', bestPrice: 0, size: 0 };
+    }
+
+    if (outcome === 'UP') {
+      // Buying UP: need askSz (sellers of UP) at askPx <= maxPrice
+      const askPx = ticker.askPx;
+      const askSz = ticker.askSz;
+      if (askPx > 0 && askSz >= minSize && askPx <= maxPrice) {
+        return { fillable: true, bestPrice: askPx, size: askSz, reason: '' };
+      }
+      return {
+        fillable: false,
+        bestPrice: askPx,
+        size: askSz,
+        reason: askPx === 0 ? 'no asks' : askPx > maxPrice ? `ask ${askPx*100}¢ > max ${maxPrice*100}¢` : `askSz ${askSz} < ${minSize}`
+      };
+    } else {
+      // Buying DOWN: need bidSz (buyers of UP) at bidPx, DOWN price = 1 - bidPx
+      const bidPx = ticker.bidPx;
+      const bidSz = ticker.bidSz;
+      const downPrice = 1 - bidPx;
+      if (bidPx > 0 && bidSz >= minSize && downPrice <= maxPrice) {
+        return { fillable: true, bestPrice: downPrice, size: bidSz, reason: '' };
+      }
+      return {
+        fillable: false,
+        bestPrice: downPrice,
+        size: bidSz,
+        reason: bidPx === 0 ? 'no bids' : downPrice > maxPrice ? `down ${downPrice*100}¢ > max ${maxPrice*100}¢` : `bidSz ${bidSz} < ${minSize}`
+      };
+    }
+  }
+
+  // ── PUBLIC: Get order book (for debugging) ──────────────────
   async getOrderBook(instId) {
     const res = await this._request('GET', '/api/v5/market/books', { instId, sz: '10' });
     const d = res.data?.[0];
@@ -88,56 +136,6 @@ class OKXClient {
       asks: (d.asks || []).map(a => ({ price: +a[0], size: +a[1] })),
       bids: (d.bids || []).map(b => ({ price: +b[0], size: +b[1] })),
       ts: d.ts,
-    };
-  }
-
-  // ── PUBLIC: Check liquidity for a specific outcome ─────────
-  // Returns { fillable, bestPrice, totalSize, depth } for the outcome
-  // 
-  // Event contract order book logic:
-  // - asks = sellers of UP (yes) → to buy UP, we hit the asks
-  // - bids = buyers of UP (yes) → to buy DOWN (no), we hit the bids (sell UP = buy DOWN)
-  // - DOWN price = 1 - UP price, so buying DOWN at P means selling UP at (1-P)
-  async checkLiquidity(instId, outcome, minSize, maxPrice) {
-    const book = await this.getOrderBook(instId);
-    if (!book) return { fillable: false, reason: 'no order book', bestPrice: 0, totalSize: 0 };
-
-    let totalSize = 0;
-    let bestPrice = 0;
-    let levels = [];
-
-    if (outcome === 'UP') {
-      // Buying UP: need asks (sellers of UP)
-      // Best ask = lowest ask price
-      for (const ask of book.asks) {
-        if (ask.price <= maxPrice) {
-          totalSize += ask.size;
-          if (bestPrice === 0) bestPrice = ask.price;
-          levels.push({ price: ask.price, size: ask.size, side: 'ask' });
-        }
-      }
-    } else {
-      // Buying DOWN: need bids (buyers of UP = we sell UP to them = buy DOWN)
-      // DOWN price = 1 - UP bid price
-      // We need UP bid price >= (1 - maxPrice) so DOWN price <= maxPrice
-      const minBidPrice = 1 - maxPrice;
-      for (const bid of book.bids) {
-        if (bid.price >= minBidPrice) {
-          totalSize += bid.size;
-          const downPrice = 1 - bid.price;
-          if (bestPrice === 0) bestPrice = downPrice;
-          levels.push({ price: downPrice, upBidPrice: bid.price, size: bid.size, side: 'bid' });
-        }
-      }
-    }
-
-    const fillable = totalSize >= minSize;
-    return {
-      fillable,
-      bestPrice,
-      totalSize,
-      levels: levels.slice(0, 5), // top 5 levels for logging
-      reason: fillable ? '' : `only ${totalSize} available, need ${minSize}`,
     };
   }
 
