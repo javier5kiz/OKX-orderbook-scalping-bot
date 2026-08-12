@@ -174,14 +174,17 @@ class OKXClient {
   async placeMarketOrder(instId, side, size, outcome) {
     const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
     
+    const szStr = String(size);
     const body = {
       instId,
       tdMode: 'isolated',
       side,
       ordType: 'market',
-      sz: String(size),
+      sz: szStr,
       outcome: okxOutcome,
     };
+    
+    logger.info(`📤 Order body: instId=${instId} sz=${szStr} outcome=${okxOutcome} side=${side} tdMode=isolated ordType=market`);
     
     const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
     
