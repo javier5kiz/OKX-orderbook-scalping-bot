@@ -249,7 +249,6 @@ class OKXClient {
       return { ordId, errorCode: 'unverifiable', errorMsg: 'Could not verify fill', filled: false, fillPx: 0, fillSz: 0, raw: d };
     }
   }
-}
 
 
   // ── PUBLIC: Get active event contract with strike price ──
@@ -311,5 +310,6 @@ class OKXClient {
     logger.warn(`⚠️ SELL UNVERIFIED: ${instId} | ordId=${ordId} | state=${details?.state || 'unknown'}`);
     return { ordId, filled: false, errorMsg: details?.state || 'unverified' };
   }
+}
 
 module.exports = OKXClient;
