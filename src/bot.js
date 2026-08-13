@@ -50,7 +50,7 @@ async function main() {
   console.log(`  Mode: ${s.dryRun ? '🟢 DRY RUN' : '🔴 LIVE (real money)'}`);
   console.log(`  Market: ${s.seriesId}`);
   console.log(`  Spot: ${s.spotTicker}`);
-  console.log(`  Entry: ±$${s.distanceThreshold} from strike, max ${s.maxEntryPrice * 100}¢`);
+  console.log(`  Entry: cheapest side ≤ ${s.maxEntryPrice * 100}¢ (orderbook scan)`);
   console.log(`  Size: ${s.contractSize} contracts ($${(s.contractSize * s.maxEntryPrice).toFixed(4)}/trade)`);
   console.log(`  TP: sell at ${s.takeProfitPrice * 100}¢ (+$${(s.contractSize * (s.takeProfitPrice - s.maxEntryPrice)).toFixed(4)})`);
   console.log(`  SL: sell at ${s.stopLossPrice * 100}¢ (-$${(s.contractSize * (s.maxEntryPrice - s.stopLossPrice)).toFixed(4)})`);
@@ -107,14 +107,15 @@ async function main() {
       // ── 4. Heartbeat every 30s ──────────────────────────
       if (now - lastHeartbeat > 30000) {
         lastHeartbeat = now;
-        const spot = await client.getSpotPrice(s.spotTicker);
-        const diff = spot ? spot - currentContract.stk : 0;
+        const ticker = await client.getEventTicker(currentContract.instId);
+        const upP = ticker?.askPx?.toFixed(2) || '?';
+        const dnP = ticker?.bidPx ? (1 - ticker.bidPx).toFixed(2) : '?';
         const filled = stats.wins + stats.losses;
         const wr = filled > 0 ? ((stats.wins / filled) * 100).toFixed(1) : '0.0';
         console.log(
           `📊 [${secsLeft}s] Trades: ${stats.trades} | W:${stats.wins} L:${stats.losses} ` +
           `TP:${stats.tpExits} SL:${stats.slExits} | WR: ${wr}% | PnL: $${stats.totalProfit.toFixed(4)} ` +
-          `| Spot: $${spot?.toFixed(2) || '?'} | Strike: $${currentContract.stk} | Diff: ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}`
+          `| UP: ${upP}¢ DOWN: ${dnP}¢ | ${position ? 'IN POSITION' : 'SCANNING'}`
         );
       }
 
@@ -127,54 +128,49 @@ async function main() {
   }
 }
 
-// ── Look for entry signal ────────────────────────────────────
+// ── Look for entry — scan orderbook, no spot threshold ───────
 async function lookForEntry(client, contract, s, balance) {
   if (balance < s.minBalance) return;
 
-  // Get spot price
-  const spot = await client.getSpotPrice(s.spotTicker);
-  if (!spot) return;
+  // Get contract ticker (orderbook)
+  const ticker = await client.getEventTicker(contract.instId);
+  if (!ticker || !ticker.last) return;
 
-  const diff = spot - contract.stk;
+  // Calculate both sides
+  const upPrice = ticker.askPx;       // buy UP (yes) at ask
+  const downPrice = 1 - ticker.bidPx;  // buy DOWN (no) at (1 - bid)
+
+  // Pick the cheaper side if it's ≤ maxEntryPrice
   let direction = null;
+  let entryPrice = 0;
 
-  if (diff >= s.distanceThreshold) {
+  if (upPrice > 0 && upPrice <= s.maxEntryPrice && downPrice > 0 && downPrice <= s.maxEntryPrice) {
+    // Both sides cheap — pick the cheaper one (underdog)
+    if (upPrice <= downPrice) {
+      direction = 'UP';
+      entryPrice = upPrice;
+    } else {
+      direction = 'DOWN';
+      entryPrice = downPrice;
+    }
+  } else if (upPrice > 0 && upPrice <= s.maxEntryPrice) {
     direction = 'UP';
-  } else if (diff <= -s.distanceThreshold) {
+    entryPrice = upPrice;
+  } else if (downPrice > 0 && downPrice <= s.maxEntryPrice) {
     direction = 'DOWN';
+    entryPrice = downPrice;
   }
 
   if (!direction) return;
-
-  // Check contract price (ticker)
-  const ticker = await client.getEventTicker(contract.instId);
-  if (!ticker) return;
-
-  // Determine price for our direction
-  let entryPrice;
-  if (direction === 'UP') {
-    entryPrice = ticker.askPx; // buy UP at ask
-  } else {
-    entryPrice = 1 - ticker.bidPx; // buy DOWN at (1 - bid)
-  }
-
-  // Only enter if price is within our limit
-  if (entryPrice > s.maxEntryPrice || entryPrice <= 0) {
-    if (config.log.showAllPolls) {
-      console.log(`   ${direction} signal but price ${entryPrice.toFixed(2)} > ${s.maxEntryPrice}¢ max`);
-    }
-    return;
-  }
 
   // ── ENTRY ──────────────────────────────────────────────
   const outcome = direction === 'UP' ? 'yes' : 'no';
   const cost = s.contractSize * entryPrice;
 
   console.log(
-    `🎯 ENTRY: ${direction} | Spot $${spot.toFixed(2)} | Strike $${contract.stk} | ` +
-    `Diff ${diff >= 0 ? '+' : ''}${diff.toFixed(2)} | Price ${entryPrice.toFixed(2)}¢ | Size ${s.contractSize} | Cost $${cost.toFixed(4)}`
+    `🎯 ENTRY: ${direction} | UP ${upPrice.toFixed(2)}¢ / DOWN ${downPrice.toFixed(2)}¢ | ` +
+    `Price ${entryPrice.toFixed(2)}¢ | Size ${s.contractSize} | Cost $${cost.toFixed(4)}`
   );
-
   if (s.dryRun) {
     console.log(`   [DRY] Would buy ${direction} at ${entryPrice.toFixed(2)}¢`);
     position = {
