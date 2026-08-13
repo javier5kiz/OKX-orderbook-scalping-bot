@@ -160,7 +160,7 @@ async function lookForEntry(client, contract, s, balance) {
 
   // Only enter if price is within our limit
   if (entryPrice > s.maxEntryPrice || entryPrice <= 0) {
-    if (s.log.showAllPolls) {
+    if (config.log.showAllPolls) {
       console.log(`   ${direction} signal but price ${entryPrice.toFixed(2)} > ${s.maxEntryPrice}¢ max`);
     }
     return;
@@ -290,7 +290,7 @@ async function monitorPosition(client, pos, s) {
   }
 
   // Log position status occasionally
-  if (s.log.showAllPolls) {
+  if (config.log.showAllPolls) {
     console.log(`   📈 ${pos.direction} @ ${currentPrice.toFixed(2)}¢ | Entry ${pos.entryPrice.toFixed(2)}¢ | PnL: $${pnl.toFixed(4)} | TP ${s.takeProfitPrice * 100}¢ / SL ${s.stopLossPrice * 100}¢`);
   }
 }
