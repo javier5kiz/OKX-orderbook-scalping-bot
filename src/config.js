@@ -41,7 +41,7 @@ module.exports = {
     //   At 60¢ entry: TP=85¢ (+$0.025), SL=55¢ (-$0.005) = 5:1 RR
     // ════════════════════════════════════════════════════════
     takeProfitPrice: 0.85,    // sell at 85¢ → +25¢ per contract
-    stopLossPrice: 0.55,      // sell at 55¢ → -5¢ per contract
+    stopLossPrice: 0.51,      // sell at 51¢ → -9¢ per contract
     // RR = 25/5 = 5:1
 
     // ════════════════════════════════════════════════════════
