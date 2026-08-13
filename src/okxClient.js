@@ -251,4 +251,65 @@ class OKXClient {
   }
 }
 
+
+  // ── PUBLIC: Get active event contract with strike price ──
+  async getActiveContract(seriesId) {
+    const path = `/api/v5/public/instruments?instType=EVENTS&seriesId=${encodeURIComponent(seriesId)}`;
+    const res = await this._request('GET', path, null, false);
+
+    if (res && res.code === '0' && Array.isArray(res.data) && res.data.length > 0) {
+      const now = Date.now();
+      const active = res.data
+        .map((item) => ({
+          instId: item.instId,
+          stk: parseFloat(item.stk || '0'),
+          expTime: parseInt(item.expTime || '0', 10),
+          state: item.state,
+          lotSz: parseFloat(item.lotSz || '0.1'),
+        }))
+        .filter((c) => c.state === 'live' && c.expTime > now && c.stk > 0)
+        .sort((a, b) => a.expTime - b.expTime);
+
+      return active[0] || null;
+    }
+    return null;
+  }
+
+  // ── PRIVATE: Sell market order (for TP/SL exits) ──────────
+  async sellMarketOrder(instId, outcome, size) {
+    const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
+    const body = {
+      instId,
+      tdMode: 'isolated',
+      side: 'sell',
+      ordType: 'market',
+      sz: String(size),
+      outcome: okxOutcome,
+    };
+
+    logger.info(`📤 SELL order: instId=${instId} sz=${size} outcome=${okxOutcome} side=sell`);
+
+    const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
+    const d = res?.data?.[0] || {};
+    const ordId = d.ordId || null;
+    const errorCode = d.sCode || res.code || '';
+    const errorMsg = d.sMsg || res.msg || '';
+
+    if (!ordId) {
+      logger.error(`SELL FAILED: ${instId} outcome=${okxOutcome} | code=${errorCode} msg=${errorMsg}`);
+      return { ordId: null, filled: false, errorMsg };
+    }
+
+    // Verify fill
+    await sleep(2000);
+    const details = await this.getOrderDetails(ordId, instId);
+    if (details && ['filled', 'partially_filled', 'effective'].includes(details.state)) {
+      logger.info(`✅ SELL FILLED: ${instId} | ordId=${ordId} | fillPx=${details.fillPx} fillSz=${details.fillSz}`);
+      return { ordId, filled: true, fillPx: details.fillPx, fillSz: details.fillSz };
+    }
+
+    logger.warn(`⚠️ SELL UNVERIFIED: ${instId} | ordId=${ordId} | state=${details?.state || 'unknown'}`);
+    return { ordId, filled: false, errorMsg: details?.state || 'unverified' };
+  }
+
 module.exports = OKXClient;

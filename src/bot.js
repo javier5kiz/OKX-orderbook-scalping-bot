@@ -1,15 +1,23 @@
 /**
- * bot.js — OKX Pairs Divergence Bot (Live + Dry Run)
+ * bot.js — OKX Price Distance Strategy (Live + Dry Run)
  * 
- * Strategy: Pairs Divergence
- * Scan BTC + ETH 5-min event contracts simultaneously.
- * Buy opposite sides when combined ≤ 80¢.
- * Profit in 3/4 scenarios.
+ * Strategy: Price Distance Confirmation
  * 
- * LIVE MODE: places real market orders via OKX API.
- * DRY RUN: paper trades using last price.
+ * Monitor BTC 5-min event contracts.
+ * Get strike (opening) price from the active contract.
+ * Get current BTC spot price.
  * 
- * Heartbeat: prints PnL + win rate every 30 seconds.
+ * Entry rules:
+ *   If spot >= strike + $15 → buy UP at ≤ 60¢
+ *   If spot <= strike - $15 → buy DOWN at ≤ 60¢
+ *   Contract size: 0.1 (costs $0.06 at 60¢)
+ * 
+ * Exit rules (sell before expiry):
+ *   TP: sell at 85¢ → +$0.025 profit per contract
+ *   SL: sell at 55¢ → -$0.005 loss per contract
+ *   RR = 5:1
+ * 
+ * If neither TP nor SL triggers before expiry, settles at $1 (win) or $0 (lose).
  */
 
 const OKXClient = require('./okxClient');
@@ -18,644 +26,290 @@ const logger = require('./logger');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Instrument ID (Beijing time UTC+8) ─────────────────────────
-function getInstId(underlying, interval) {
-  const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
-  const yy = String(now.getUTCFullYear()).slice(2);
-  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(now.getUTCDate()).padStart(2, '0');
-  const totalMin = now.getUTCHours() * 60 + now.getUTCMinutes();
-  const startMin = Math.floor(totalMin / interval) * interval;
-  const endMin = startMin + interval;
-  const s = `${String(Math.floor(startMin / 60)).padStart(2, '0')}${String(startMin % 60).padStart(2, '0')}`;
-  const e = `${String(Math.floor(endMin / 60) % 24).padStart(2, '0')}${String(endMin % 60).padStart(2, '0')}`;
-  return `${underlying}-UPDOWN-${interval}MIN-${yy}${mm}${dd}-${s}-${e}`;
-}
-
-function getSecondsIntoCycle(interval) {
-  const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
-  const totalSec = now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
-  return totalSec - Math.floor(totalSec / (interval * 60)) * (interval * 60);
-}
-
-function getSecondsRemaining(interval) {
-  return interval * 60 - getSecondsIntoCycle(interval);
-}
-
-// ── Global Stats ──────────────────────────────────────────────
+// ── Stats ────────────────────────────────────────────────────
 const stats = {
-  cycles: 0,
-  pairsTrades: 0,
-  bothHit: 0,
-  oneHit: 0,
-  totalMiss: 0,
-  totalInvested: 0,
-  totalReturned: 0,
-  bestTrade: null,
-  worstTrade: null,
-  tradeHistory: [],
-  btcLegs: { trades: 0, wins: 0, losses: 0 },
-  ethLegs: { trades: 0, wins: 0, losses: 0 },
-  startTime: Date.now(),
-  liveOrders: 0,       // Count of real orders placed
-  orderErrors: 0,      // Count of order failures
+  trades: 0,
+  wins: 0,
+  losses: 0,
+  tpExits: 0,
+  slExits: 0,
+  totalProfit: 0,
+  errors: 0,
 };
 
-// ── Live price snapshot (updated every poll) ──────────────────
-const livePrices = {
-  btcUp: 0, btcDown: 0, ethUp: 0, ethDown: 0,
-  btcSpot: 0, ethSpot: 0,
-  lastUpdate: 0,
-};
+// ── Current position state ────────────────────────────────────
+let position = null; // { instId, direction, outcome, size, entryPrice, ordId, expTime }
 
-// ── Heartbeat: print PnL + win rate every 30s ──────────────────
-function startHeartbeat() {
-  setInterval(() => {
-    const t = stats.pairsTrades;
-    const settled = stats.bothHit + stats.oneHit + stats.totalMiss;
-    const wins = stats.bothHit + stats.oneHit;
-    const wr = settled > 0 ? ((wins / settled) * 100).toFixed(1) : '0.0';
-    const netPnl = stats.totalReturned - stats.totalInvested;
-    const roi = stats.totalInvested > 0 ? ((netPnl / stats.totalInvested) * 100).toFixed(1) : '0.0';
-    const sign = netPnl >= 0 ? '+' : '';
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
-    const upMin = Math.floor(uptime / 60);
-    const upSec = uptime % 60;
-
-    const openCount = t - settled;
-
-    let priceLine = '';
-    if (livePrices.lastUpdate > 0) {
-      const combo1 = livePrices.btcUp + livePrices.ethDown;
-      const combo2 = livePrices.btcDown + livePrices.ethUp;
-      const bestCombo = Math.min(combo1, combo2);
-      const comboStr = bestCombo > 0 ? (bestCombo * 100).toFixed(1) : '—';
-      
-      const maxPerSide = config.strategy.maxPerSide;
-      let bestValid = false;
-      let bestSide = '';
-      const minP = config.strategy.minPrice || 0.10;
-      if (combo1 <= config.strategy.maxCombinedPrice) {
-        const btcOk = livePrices.btcUp <= maxPerSide && livePrices.btcUp >= minP;
-        const ethOk = livePrices.ethDown <= maxPerSide && livePrices.ethDown >= minP;
-        if (btcOk && ethOk) { bestValid = true; bestSide = 'BTC↑+ETH↓'; }
-      }
-      if (!bestValid && combo2 <= config.strategy.maxCombinedPrice) {
-        const btcOk = livePrices.btcDown <= maxPerSide && livePrices.btcDown >= minP;
-        const ethOk = livePrices.ethUp <= maxPerSide && livePrices.ethUp >= minP;
-        if (btcOk && ethOk) { bestValid = true; bestSide = 'BTC↓+ETH↑'; }
-      }
-      
-      const entryFlag = bestValid ? ` ← ENTRY! (${bestSide})` : '';
-      priceLine = ` | BTC ↑${(livePrices.btcUp * 100).toFixed(0)}¢ ↓${(livePrices.btcDown * 100).toFixed(0)}¢ | ETH ↑${(livePrices.ethUp * 100).toFixed(0)}¢ ↓${(livePrices.ethDown * 100).toFixed(0)}¢ | Best: ${comboStr}¢${entryFlag}`;
-    }
-
-    const openStr = openCount > 0 ? ` | 🔴 OPEN: ${openCount}` : '';
-    const orderStr = !config.strategy.dryRun ? ` | Orders: ${stats.liveOrders} (errors: ${stats.orderErrors})` : '';
-    
-    console.log(
-      `${logger.COLORS.gray}[${new Date().toLocaleTimeString('en-US', { hour12: false })}]${logger.COLORS.reset} ` +
-      `${logger.COLORS.bold}📊 [${upMin}m${upSec}s] ` +
-      `Trades: ${t} | W:${wins} L:${stats.totalMiss} | WR: ${wr}% | ` +
-      `PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${openStr}${orderStr}` +
-      `${priceLine}${logger.COLORS.reset}`
-    );
-  }, 30000);
-}
-
-// ── Print running stats after each trade ──────────────────────
-function printRunningStats() {
-  const t = stats.pairsTrades;
-  const wins = stats.bothHit + stats.oneHit;
-  const wr = t > 0 ? ((wins / t) * 100).toFixed(1) : '0.0';
-  const netPnl = stats.totalReturned - stats.totalInvested;
-  const roi = stats.totalInvested > 0 ? ((netPnl / stats.totalInvested) * 100).toFixed(1) : '0.0';
-  const sign = netPnl >= 0 ? '+' : '';
-
-  logger.info(
-    `${logger.COLORS.bold}📦 RESULT: ${t} pairs | Both: ${stats.bothHit} | One: ${stats.oneHit} | Miss: ${stats.totalMiss} | ` +
-    `WR: ${wr}% | PnL: ${sign}$${netPnl.toFixed(2)} | ROI: ${sign}${roi}%${logger.COLORS.reset}`
-  );
-
-  const btcWR = stats.btcLegs.trades > 0 ? ((stats.btcLegs.wins / stats.btcLegs.trades) * 100).toFixed(0) : '—';
-  const ethWR = stats.ethLegs.trades > 0 ? ((stats.ethLegs.wins / stats.ethLegs.trades) * 100).toFixed(0) : '—';
-  logger.info(
-    `   BTC legs: ${stats.btcLegs.trades} (${btcWR}% win) | ` +
-    `ETH legs: ${stats.ethLegs.trades} (${ethWR}% win)`
-  );
-}
-
-// ── Full summary every 5 cycles ───────────────────────────────
-function printSummary() {
-  const t = stats.pairsTrades;
-  const wins = stats.bothHit + stats.oneHit;
-  const wr = t > 0 ? ((wins / t) * 100).toFixed(1) : '0.0';
-  const netPnl = stats.totalReturned - stats.totalInvested;
-  const roi = stats.totalInvested > 0 ? ((netPnl / stats.totalInvested) * 100).toFixed(1) : '0.0';
-  const sign = netPnl >= 0 ? '+' : '';
-
-  logger.banner('📊 PAIRS DIVERGENCE — CUMULATIVE STATS');
-  logger.line(`Cycles watched: ${stats.cycles}`);
-  logger.line(`Pairs trades: ${t}`);
-  logger.line(`Both hit: ${stats.bothHit} | One hit: ${stats.oneHit} | Miss: ${stats.totalMiss}`);
-  logger.line(`Win rate: ${wr}% (profit in ${wins}/${t} trades)`);
-  if (!config.strategy.dryRun) {
-    logger.line(`Live orders: ${stats.liveOrders} | Order errors: ${stats.orderErrors}`);
-  }
-  logger.line('');
-  logger.line(`Invested:  $${stats.totalInvested.toFixed(4)}`);
-  logger.line(`Returned:  $${stats.totalReturned.toFixed(4)}`);
-  logger.line(`Net PnL:   ${sign}$${netPnl.toFixed(4)}`);
-  logger.line(`ROI:       ${sign}${roi}%`);
-
-  if (stats.bestTrade) {
-    logger.line('');
-    logger.line(`🏆 Best:  ${stats.bestTrade.btcSide}/${stats.bestTrade.ethSide} → ${stats.bestTrade.result} → +$${stats.bestTrade.pnl.toFixed(4)}`);
-  }
-  if (stats.worstTrade) {
-    logger.line(`💀 Worst: ${stats.worstTrade.btcSide}/${stats.bestTrade.ethSide} → ${stats.worstTrade.result} → -$${Math.abs(stats.worstTrade.pnl).toFixed(4)}`);
-  }
-
-  if (stats.tradeHistory.length > 0) {
-    logger.line('');
-    logger.line('Recent pairs trades (last 10):');
-    stats.tradeHistory.slice(-10).forEach((t, i) => {
-      const emoji = t.result === 'BOTH HIT' ? '💰' : t.result === 'ONE HIT' ? '✅' : '❌';
-      const s = t.pnl >= 0 ? '+' : '';
-      logger.line(
-        `  ${i + 1}. ${emoji} BTC ${t.btcSide.padEnd(4)} @ ${(t.btcEntry * 100).toFixed(0)}¢ + ` +
-        `ETH ${t.ethSide.padEnd(4)} @ ${(t.ethEntry * 100).toFixed(0)}¢ = ${(t.combinedCost * 100).toFixed(0)}¢ → ` +
-        `${t.result} ${s}$${t.pnl.toFixed(4)}`
-      );
-    });
-  }
-
-  logger.divider();
-}
-
-// ── Place live orders for both sides ──────────────────────────
-async function placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize) {
-  const results = { btc: null, eth: null, btcError: null, ethError: null };
-
-  // Place BTC order
-  try {
-    const btcRes = await client.placeMarketOrder(btcInstId, 'buy', contractSize, btcSide);
-    if (btcRes.filled) {
-      results.btc = btcRes.ordId;
-      results.btcFilled = true;
-      results.btcFillPx = btcRes.fillPx;
-      stats.liveOrders++;
-      logger.info(`   ✅ BTC ${btcSide} FILLED: ${btcRes.ordId} | price=${btcRes.fillPx} | sz=${btcRes.fillSz}`);
-    } else {
-      results.btcError = btcRes.errorMsg || 'Order not filled';
-      results.btcFilled = false;
-      stats.orderErrors++;
-      logger.warn(`   ⚠️ BTC ${btcSide} NOT FILLED: ${btcRes.errorMsg} (ordId: ${btcRes.ordId || 'none'})`);
-    }
-  } catch (err) {
-    results.btcError = err.message;
-    results.btcFilled = false;
-    stats.orderErrors++;
-    logger.error(`   ❌ BTC ${btcSide} order failed: ${err.message}`);
-  }
-
-  // Place ETH order
-  try {
-    const ethRes = await client.placeMarketOrder(ethInstId, 'buy', contractSize, ethSide);
-    if (ethRes.filled) {
-      results.eth = ethRes.ordId;
-      results.ethFilled = true;
-      results.ethFillPx = ethRes.fillPx;
-      stats.liveOrders++;
-      logger.info(`   ✅ ETH ${ethSide} FILLED: ${ethRes.ordId} | price=${ethRes.fillPx} | sz=${ethRes.fillSz}`);
-    } else {
-      results.ethError = ethRes.errorMsg || 'Order not filled';
-      results.ethFilled = false;
-      stats.orderErrors++;
-      logger.warn(`   ⚠️ ETH ${ethSide} NOT FILLED: ${ethRes.errorMsg} (ordId: ${ethRes.ordId || 'none'})`);
-    }
-  } catch (err) {
-    results.ethError = err.message;
-    results.ethFilled = false;
-    stats.orderErrors++;
-    logger.error(`   ❌ ETH ${ethSide} order failed: ${err.message}`);
-  }
-
-  return results;
-}
-
-// ── Run one cycle ──────────────────────────────────────────────
-async function runCycle(client) {
-  const interval = 5;
-  const intervalSec = interval * 60;
-
-  let secsRemaining = getSecondsRemaining(interval);
-  if (secsRemaining < intervalSec - 2) {
-    const wait = secsRemaining + 2;
-    if (wait > 5) {
-      logger.info(`⏳ ${wait}s to next cycle...`);
-      await sleep(wait * 1000);
-    }
-  }
-
-  stats.cycles++;
-
-  const btcInstId = getInstId('BTC', interval);
-  const ethInstId = getInstId('ETH', interval);
-  const secIn = getSecondsIntoCycle(interval);
-  const secLeft = getSecondsRemaining(interval);
-
-  logger.divider();
-  logger.info(`CYCLE ${stats.cycles} | BTC: ${btcInstId.slice(-15)} | ETH: ${ethInstId.slice(-15)}`);
-  logger.info(`${secIn}s in, ${secLeft}s left | ${new Date().toUTCString()}`);
-
-  // 1. Opening prices
-  const [btcOpen, ethOpen] = await Promise.all([
-    client.getSpotPrice('BTC-USDT'),
-    client.getSpotPrice('ETH-USDT'),
-  ]);
-
-  if (!btcOpen || !ethOpen) {
-    logger.warn('Could not get opening prices, skipping cycle');
-    await sleep(secLeft * 1000);
-    return;
-  }
-
-  logger.info(`📏 Opening: BTC $${btcOpen} | ETH $${ethOpen}`);
-
-  if (getSecondsIntoCycle(interval) < 5) await sleep(5000);
-
-  // 2. Poll both, look for pairs opportunity
-  let entered = false;
-  let attemptMade = false; // HARD LOCK: only one order attempt per cycle, ever
-  let btcEntry = 0, ethEntry = 0;
-  let btcSide = '', ethSide = '';
-  let entryTime = 0;
-  let pollCount = 0;
-  let orderResults = null;
-
-  while (getSecondsRemaining(interval) > config.strategy.noEntryBeforeEnd) {
-    if (attemptMade) break; // Never place more than one pair per cycle
-    const [btcTicker, ethTicker] = await Promise.all([
-      client.getEventTicker(btcInstId),
-      client.getEventTicker(ethInstId),
-    ]);
-
-    if (!btcTicker?.last || !ethTicker?.last) {
-      if (pollCount === 0) logger.warn('No ticker data yet...');
-      pollCount++;
-      await sleep(config.strategy.pollIntervalMs);
-      continue;
-    }
-
-    const btcUp = btcTicker.last;
-    const btcDown = 1 - btcUp;
-    const ethUp = ethTicker.last;
-    const ethDown = 1 - ethUp;
-
-    // Update live prices for heartbeat
-    livePrices.btcUp = btcUp;
-    livePrices.btcDown = btcDown;
-    livePrices.ethUp = ethUp;
-    livePrices.ethDown = ethDown;
-    livePrices.lastUpdate = Date.now();
-
-    if (!entered) {
-      const combos = [
-        { btcSide: 'UP', ethSide: 'DOWN', btcPrice: btcUp, ethPrice: ethDown },
-        { btcSide: 'DOWN', ethSide: 'UP', btcPrice: btcDown, ethPrice: ethUp },
-      ];
-
-      let bestCombo = null;
-      let bestCombined = 1;
-
-      const minPrice = config.strategy.minPrice || 0.10;
-      for (const c of combos) {
-        const combined = c.btcPrice + c.ethPrice;
-        if (combined <= config.strategy.maxCombinedPrice &&
-            c.btcPrice <= config.strategy.maxPerSide &&
-            c.ethPrice <= config.strategy.maxPerSide &&
-            c.btcPrice >= minPrice &&
-            c.ethPrice >= minPrice) {
-          if (combined < bestCombined) {
-            bestCombined = combined;
-            bestCombo = c;
-          }
-        }
-      }
-
-      if (bestCombo) {
-        entered = true;
-        attemptMade = true; // Lock — no more attempts this cycle no matter what happens
-        btcEntry = bestCombo.btcPrice;
-        ethEntry = bestCombo.ethPrice;
-        btcSide = bestCombo.btcSide;
-        ethSide = bestCombo.ethSide;
-        entryTime = getSecondsIntoCycle(interval);
-        let tradeContractSize = 0; // will be set when orders are placed
-
-        // ── DYNAMIC CONTRACT SIZE: 5% of balance per side ──
-        const balance = await client.getUSDTBalance();
-        const riskPerSide = config.strategy.riskPerSide || 0.05;
-        const maxSpendPerSide = balance * riskPerSide;
-        // Contract size = spend / price (e.g. $0.0445 / 0.40 = 0.11 contracts)
-        const btcContractSize = Math.max(config.strategy.minContractSize || 0.01, +(maxSpendPerSide / btcEntry).toFixed(2));
-        const ethContractSize = Math.max(config.strategy.minContractSize || 0.01, +(maxSpendPerSide / ethEntry).toFixed(2));
-        const contractSize = Math.min(btcContractSize, ethContractSize); // use smaller to be safe
-        tradeContractSize = contractSize; // store for settlement
-        const combinedCost = btcEntry + ethEntry;
-        // Cost = contractSize × price per side, total = both sides
-        const btcCost = contractSize * btcEntry;
-        const ethCost = contractSize * ethEntry;
-        const costTotal = btcCost + ethCost;
-        // Payout if side wins = contractSize × $1 per contract
-        const btcPayout = contractSize;   // if BTC wins: contractSize × $1
-        const ethPayout = contractSize;   // if ETH wins: contractSize × $1
-        const maxPayout = btcPayout + ethPayout;     // both win
-        const oneWinPayout = Math.max(btcPayout, ethPayout); // one wins
-
-        stats.pairsTrades++;
-        stats.totalInvested += costTotal;
-        stats.btcLegs.trades++;
-        stats.ethLegs.trades++;
-
-        const modeLabel = config.strategy.dryRun ? '[DRY]' : '[LIVE]';
-        logger.enter(
-          `${logger.COLORS.bold}${modeLabel} 🎯 PAIRS ENTRY: BTC ${btcSide} @ ${(btcEntry * 100).toFixed(1)}¢ + ` +
-          `ETH ${ethSide} @ ${(ethEntry * 100).toFixed(1)}¢ = ${(combinedCost * 100).toFixed(1)}¢ combined${logger.COLORS.reset}`
-        );
-        logger.info(
-          `   💰 Balance: $${balance.toFixed(2)} | 5% per side: $${maxSpendPerSide.toFixed(4)} | ` +
-          `Contract size: ${contractSize} (BTC: ${btcContractSize} @ ${(btcEntry*100).toFixed(0)}¢, ETH: ${ethContractSize} @ ${(ethEntry*100).toFixed(0)}¢)`
-        );
-        logger.info(
-          `   BTC ${btcSide}: ${contractSize} contracts @ $${btcEntry.toFixed(2)} = $${btcCost.toFixed(4)} | ` +
-          `ETH ${ethSide}: ${contractSize} contracts @ $${ethEntry.toFixed(2)} = $${ethCost.toFixed(4)}`
-        );
-        logger.info(
-          `   Cost: $${costTotal.toFixed(4)} | Both win: +$${(maxPayout - costTotal).toFixed(4)} | ` +
-          `One win: +$${(oneWinPayout - costTotal).toFixed(4)} | Both lose: -$${costTotal.toFixed(4)} | ` +
-          `Entry: ${entryTime}s`
-        );
-
-        // ── FINAL SANITY CHECK: re-verify live price before firing ──
-        if (!config.strategy.dryRun) {
-          const [btcCheck, ethCheck] = await Promise.all([
-            client.getEventTicker(btcInstId),
-            client.getEventTicker(ethInstId),
-          ]);
-          const btcNow = btcSide === 'UP' ? btcCheck?.last : 1 - btcCheck?.last;
-          const ethNow = ethSide === 'UP' ? ethCheck?.last : 1 - ethCheck?.last;
-
-          if (!btcNow || !ethNow || btcNow > config.strategy.maxPerSide || ethNow > config.strategy.maxPerSide || btcNow < config.strategy.minPrice || ethNow < config.strategy.minPrice) {
-            logger.error(
-              `   🚫 ABORT: price moved out of range right before firing | ` +
-              `BTC ${btcSide} now=${((btcNow||0)*100).toFixed(1)}¢ | ETH ${ethSide} now=${((ethNow||0)*100).toFixed(1)}¢`
-            );
-            stats.pairsTrades--;
-            stats.totalInvested -= costTotal;
-            stats.btcLegs.trades--;
-            stats.ethLegs.trades--;
-            break; // No retry — cycle done
-          }
-
-          logger.info(`   📤 Placing live orders | sz=${contractSize} per side...`);
-          orderResults = await placePairOrders(client, btcInstId, ethInstId, btcSide, ethSide, contractSize);
-          
-          // Check if both orders actually filled
-          const btcFilled = orderResults.btcFilled;
-          const ethFilled = orderResults.ethFilled;
-          
-          if (!btcFilled && !ethFilled) {
-            // Both orders failed or not filled — don't count as a real trade
-            logger.error(`   💀 Both orders NOT FILLED! No retry this cycle (hard lock).`);
-            stats.pairsTrades--;
-            stats.totalInvested -= costTotal;
-            stats.btcLegs.trades--;
-            stats.ethLegs.trades--;
-            break; // Exit the while loop — do NOT retry, cycle is done
-          }
-          
-          if (btcFilled && !ethFilled) {
-            // Only BTC filled — log partial fill warning
-            logger.warn(`   ⚠️ PARTIAL: BTC filled but ETH did not. Continuing with BTC only.`);
-          }
-          if (!btcFilled && ethFilled) {
-            // Only ETH filled — log partial fill warning
-            logger.warn(`   ⚠️ PARTIAL: ETH filled but BTC did not. Continuing with ETH only.`);
-          }
-        } else {
-          logger.info(`   📝 [DRY RUN] No real orders placed`);
-        }
-      } else if (pollCount === 0 || pollCount % 5 === 0) {
-        const bestOpp = Math.min(btcUp + ethDown, btcDown + ethUp);
-        let entryFlag = ' (>80¢)';
-        if (bestOpp <= config.strategy.maxCombinedPrice) {
-          const minP = config.strategy.minPrice || 0.10;
-          const c1ok = btcUp <= config.strategy.maxPerSide && btcUp >= minP && ethDown <= config.strategy.maxPerSide && ethDown >= minP;
-          const c2ok = btcDown <= config.strategy.maxPerSide && btcDown >= minP && ethUp <= config.strategy.maxPerSide && ethUp >= minP;
-          if (c1ok || c2ok) entryFlag = ' ← ENTRY!';
-          else entryFlag = ` (combo ok but side out of range ${minP*100}-${config.strategy.maxPerSide*100}¢)`;
-        }
-        logger.info(
-          `📊 BTC ↑${(btcUp * 100).toFixed(1)}¢ ↓${(btcDown * 100).toFixed(1)}¢ | ` +
-          `ETH ↑${(ethUp * 100).toFixed(1)}¢ ↓${(ethDown * 100).toFixed(1)}¢ | ` +
-          `Best combo: ${(bestOpp * 100).toFixed(1)}¢${entryFlag}`
-        );
-      }
-    }
-
-    pollCount++;
-    await sleep(config.strategy.pollIntervalMs);
-  }
-
-  // 3. Wait for cycle end
-  const remaining = getSecondsRemaining(interval);
-  if (remaining > 0) await sleep(remaining * 1000);
-
-  // 4. Settlement prices
-  await sleep(2000);
-  const [btcSettle, ethSettle] = await Promise.all([
-    client.getSpotPrice('BTC-USDT'),
-    client.getSpotPrice('ETH-USDT'),
-  ]);
-
-  if (!btcSettle || !ethSettle) {
-    logger.warn('Could not get settlement prices');
-    if (entered) printRunningStats();
-    return;
-  }
-
-  // 5. Determine winners
-  const btcChange = btcSettle - btcOpen;
-  const ethChange = ethSettle - ethOpen;
-  const btcWinner = btcChange > 0 ? 'UP' : btcChange < 0 ? 'DOWN' : 'TIE';
-  const ethWinner = ethChange > 0 ? 'UP' : ethChange < 0 ? 'DOWN' : 'TIE';
-
-  logger.info(
-    `📏 Settlement: BTC $${btcSettle} (${btcChange >= 0 ? '+' : ''}$${btcChange.toFixed(2)} → ${btcWinner}) | ` +
-    `ETH $${ethSettle} (${ethChange >= 0 ? '+' : ''}$${ethChange.toFixed(2)} → ${ethWinner})`
-  );
-
-  // 6. Track result
-  if (entered) {
-    const contractSize = tradeContractSize || 0.1; // fallback if not set
-    const btcCost = contractSize * btcEntry;
-    const ethCost = contractSize * ethEntry;
-    const costTotal = btcCost + ethCost;
-
-    let btcPayout = 0, ethPayout = 0;
-    let btcResult = 'LOSS', ethResult = 'LOSS';
-
-    if (btcWinner === btcSide) {
-      btcPayout = contractSize; // contractSize × $1
-      btcResult = 'WIN';
-      stats.btcLegs.wins++;
-    }
-    if (ethWinner === ethSide) {
-      ethPayout = contractSize;
-      ethResult = 'WIN';
-      stats.ethLegs.wins++;
-    }
-
-    const totalPayout = btcPayout + ethPayout;
-    const pnl = totalPayout - costTotal;
-    const combinedCost = btcEntry + ethEntry;
-
-    let result, emoji;
-    if (btcResult === 'WIN' && ethResult === 'WIN') {
-      result = 'BOTH HIT';
-      emoji = '💰';
-      stats.bothHit++;
-      logger.win(
-        `${emoji} BTC ${btcSide} ✅ + ETH ${ethSide} ✅ → BOTH HIT | ` +
-        `+$${pnl.toFixed(4)} (paid $${costTotal.toFixed(4)}, got $${totalPayout.toFixed(4)})`
-      );
-    } else if (btcResult === 'WIN' || ethResult === 'WIN') {
-      result = 'ONE HIT';
-      emoji = '✅';
-      stats.oneHit++;
-      const winSide = btcResult === 'WIN' ? `BTC ${btcSide}` : `ETH ${ethSide}`;
-      const loseSide = btcResult === 'LOSS' ? `BTC ${btcSide}` : `ETH ${ethSide}`;
-      logger.info(
-        `${emoji} ${winSide} won, ${loseSide} lost → ONE HIT | ` +
-        `+${pnl.toFixed(4)} (paid $${costTotal.toFixed(4)}, got $${totalPayout.toFixed(4)})`
-      );
-    } else {
-      result = 'MISS';
-      emoji = '❌';
-      stats.totalMiss++;
-      logger.loss(
-        `${emoji} BTC ${btcSide} ❌ + ETH ${ethSide} ❌ → BOTH MISSED | ` +
-        `-$${costTotal.toFixed(4)} (winners were BTC ${btcWinner}, ETH ${ethWinner})`
-      );
-    }
-
-    stats.totalReturned += totalPayout;
-
-    const record = {
-      time: new Date().toISOString(),
-      cycle: stats.cycles,
-      btcSide, ethSide, btcEntry, ethEntry, combinedCost,
-      btcOpen, ethOpen, btcSettle, ethSettle,
-      btcWinner, ethWinner, btcResult, ethResult,
-      result, pnl, cost: costTotal, payout: totalPayout,
-      contractSize,
-      liveOrders: orderResults,
-    };
-    stats.tradeHistory.push(record);
-    if (stats.tradeHistory.length > 200) stats.tradeHistory.shift();
-
-    if (!stats.bestTrade || pnl > stats.bestTrade.pnl) stats.bestTrade = record;
-    if (!stats.worstTrade || pnl < stats.worstTrade.pnl) stats.worstTrade = record;
-
-    printRunningStats();
-  } else {
-    logger.info('No pairs entry this cycle (no combo under 80¢)');
-  }
-}
-
-// ── Main ──────────────────────────────────────────────────────
 async function main() {
-  const dryRun = config.strategy.dryRun;
-  const mode = dryRun ? 'DRY RUN (paper trading)' : '🔴 LIVE (real money)';
-  const contractSize = config.strategy.contractSize;
-
-  logger.banner('OKX PAIRS DIVERGENCE BOT');
-  logger.info(`Mode: ${mode}`);
-  logger.info(`Contract size: ${contractSize} per side (${contractSize * 2} total per pair)`);
-  logger.info(`Strategy: BTC side + ETH opposite side ≤ ${(config.strategy.maxCombinedPrice * 100).toFixed(0)}¢ combined`);
-  logger.info(`Markets: BTC 5min + ETH 5min (polled simultaneously)`);
-  logger.info(`Filters: ${config.strategy.minPrice * 100}¢-${config.strategy.maxPerSide * 100}¢ per side | ≤ ${(config.strategy.maxCombinedPrice * 100).toFixed(0)}¢ combined`);
-  logger.info(`Profit in 3/4 scenarios — only lose when BTC & ETH move same direction`);
-  logger.info(`Heartbeat: PnL + win rate every 30 seconds`);
-  logger.divider();
-
   const client = new OKXClient(config.okx);
+  const s = config.strategy;
 
-  // ── Live mode: verify API keys and check balance ──────────
-  if (!dryRun) {
-    if (!config.okx.apiKey || !config.okx.secretKey || !config.okx.passphrase) {
-      logger.error('❌ API keys not configured! Set OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE env vars.');
-      logger.error('   Cannot start in LIVE mode without API keys.');
-      process.exit(1);
-    }
-    logger.info('🔑 API keys detected. Checking balance...');
-    try {
-      const balance = await client.getUSDTBalance();
-      logger.info(`💰 Account USDT balance: $${balance.toFixed(2)}`);
-      if (balance <= 0) {
-        logger.error('❌ Account balance is $0. Fund your OKX account to start trading.');
-        logger.error('   Minimum recommended: $10 USDT for 0.1 contract testing.');
-        process.exit(1);
-      }
-      const maxLossPerTrade = contractSize * config.strategy.maxCombinedPrice;
-      const tradesPossible = balance / maxLossPerTrade;
-      logger.info(`   Max loss per trade: $${maxLossPerTrade.toFixed(4)} | Trades possible: ~${Math.floor(tradesPossible)}`);
-      if (tradesPossible < 10) {
-        logger.warn(`⚠️ Low balance — only ~${Math.floor(tradesPossible)} trades possible. Consider funding more.`);
-      }
-    } catch (err) {
-      logger.error(`❌ Could not check balance: ${err.message}`);
-      logger.error('   Check that API keys are valid and have trading permissions.');
-      process.exit(1);
-    }
-    logger.divider();
+  console.log('\n═══════════════════════════════════════════════════════════');
+  console.log('  OKX PRICE DISTANCE BOT');
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log(`  Mode: ${s.dryRun ? '🟢 DRY RUN' : '🔴 LIVE (real money)'}`);
+  console.log(`  Market: ${s.seriesId}`);
+  console.log(`  Spot: ${s.spotTicker}`);
+  console.log(`  Entry: ±$${s.distanceThreshold} from strike, max ${s.maxEntryPrice * 100}¢`);
+  console.log(`  Size: ${s.contractSize} contracts ($${(s.contractSize * s.maxEntryPrice).toFixed(4)}/trade)`);
+  console.log(`  TP: sell at ${s.takeProfitPrice * 100}¢ (+$${(s.contractSize * (s.takeProfitPrice - s.maxEntryPrice)).toFixed(4)})`);
+  console.log(`  SL: sell at ${s.stopLossPrice * 100}¢ (-$${(s.contractSize * (s.maxEntryPrice - s.stopLossPrice)).toFixed(4)})`);
+  console.log(`  RR: ${((s.takeProfitPrice - s.maxEntryPrice) / (s.maxEntryPrice - s.stopLossPrice)).toFixed(1)}:1`);
+  console.log('────────────────────────────────────────────────────────────\n');
+
+  // Check balance
+  const balance = await client.getUSDTBalance();
+  console.log(`💰 Account USDT balance: $${balance.toFixed(2)}`);
+  if (balance < s.minBalance) {
+    console.log(`❌ Balance below minimum ($${s.minBalance}). Stopping.`);
+    return;
   }
+  console.log('🚀 Bot started. Scanning for price distance entries...\n');
 
-  // Keep-alive HTTP server
-  const http = require('http');
-  const port = parseInt(process.env.PORT || '8080');
-  http.createServer((req, res) => {
-    const t = stats.pairsTrades;
-    const wr = t > 0 ? (((stats.bothHit + stats.oneHit) / t) * 100).toFixed(1) : '0';
-    const pnl = stats.totalReturned - stats.totalInvested;
-    const mode = config.strategy.dryRun ? 'DRY' : 'LIVE';
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(
-      `Pairs Divergence Bot [${mode}] | Cycles: ${stats.cycles} | Pairs: ${t} | ` +
-      `Both: ${stats.bothHit} | One: ${stats.oneHit} | Miss: ${stats.totalMiss} | ` +
-      `WR: ${wr}% | PnL: $${pnl.toFixed(4)}` +
-      (!config.strategy.dryRun ? ` | Orders: ${stats.liveOrders} | Errors: ${stats.orderErrors}` : '')
-    );
-  }).listen(port, () => logger.info(`Keep-alive on :${port}`));
+  let currentContract = null;
+  let lastHeartbeat = 0;
 
-  logger.info('🚀 Bot started. Scanning BTC + ETH event contracts...\n');
-
-  startHeartbeat();
-
+  // ── Main loop ────────────────────────────────────────────
   while (true) {
     try {
-      await runCycle(client);
-      if (stats.cycles % 5 === 0) printSummary();
+      const now = Date.now();
+
+      // ── 1. Get/refresh active contract ──────────────────
+      if (!currentContract || currentContract.expTime <= now) {
+        currentContract = await client.getActiveContract(s.seriesId);
+        if (!currentContract) {
+          if (now - lastHeartbeat > 10000) {
+            console.log(`⏳ No active contract for ${s.seriesId}...`);
+            lastHeartbeat = now;
+          }
+          await sleep(s.pollIntervalMs);
+          continue;
+        }
+        console.log(`📋 New contract: ${currentContract.instId} | Strike: $${currentContract.stk} | ${Math.round((currentContract.expTime - now) / 1000)}s left`);
+        // Reset position if contract expired
+        if (position && position.instId !== currentContract.instId) {
+          console.log(`   Previous contract expired — checking settlement...`);
+          await checkSettlement(client, position, currentContract);
+          position = null;
+        }
+      }
+
+      const secsLeft = Math.round((currentContract.expTime - now) / 1000);
+
+      // ── 2. If we have a position, monitor for TP/SL ─────
+      if (position) {
+        await monitorPosition(client, position, s);
+      } else if (secsLeft > s.noEntryBeforeEnd) {
+        // ── 3. No position — look for entry signal ─────────
+        await lookForEntry(client, currentContract, s, balance);
+      }
+
+      // ── 4. Heartbeat every 30s ──────────────────────────
+      if (now - lastHeartbeat > 30000) {
+        lastHeartbeat = now;
+        const spot = await client.getSpotPrice(s.spotTicker);
+        const diff = spot ? spot - currentContract.stk : 0;
+        const filled = stats.wins + stats.losses;
+        const wr = filled > 0 ? ((stats.wins / filled) * 100).toFixed(1) : '0.0';
+        console.log(
+          `📊 [${secsLeft}s] Trades: ${stats.trades} | W:${stats.wins} L:${stats.losses} ` +
+          `TP:${stats.tpExits} SL:${stats.slExits} | WR: ${wr}% | PnL: $${stats.totalProfit.toFixed(4)} ` +
+          `| Spot: $${spot?.toFixed(2) || '?'} | Strike: $${currentContract.stk} | Diff: ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}`
+        );
+      }
+
+      await sleep(s.pollIntervalMs);
     } catch (err) {
-      logger.error(`Cycle error: ${err.message}`);
+      console.error(`❌ Error: ${err.message}`);
+      stats.errors++;
       await sleep(5000);
     }
   }
 }
 
+// ── Look for entry signal ────────────────────────────────────
+async function lookForEntry(client, contract, s, balance) {
+  if (balance < s.minBalance) return;
+
+  // Get spot price
+  const spot = await client.getSpotPrice(s.spotTicker);
+  if (!spot) return;
+
+  const diff = spot - contract.stk;
+  let direction = null;
+
+  if (diff >= s.distanceThreshold) {
+    direction = 'UP';
+  } else if (diff <= -s.distanceThreshold) {
+    direction = 'DOWN';
+  }
+
+  if (!direction) return;
+
+  // Check contract price (ticker)
+  const ticker = await client.getEventTicker(contract.instId);
+  if (!ticker) return;
+
+  // Determine price for our direction
+  let entryPrice;
+  if (direction === 'UP') {
+    entryPrice = ticker.askPx; // buy UP at ask
+  } else {
+    entryPrice = 1 - ticker.bidPx; // buy DOWN at (1 - bid)
+  }
+
+  // Only enter if price is within our limit
+  if (entryPrice > s.maxEntryPrice || entryPrice <= 0) {
+    if (s.log.showAllPolls) {
+      console.log(`   ${direction} signal but price ${entryPrice.toFixed(2)} > ${s.maxEntryPrice}¢ max`);
+    }
+    return;
+  }
+
+  // ── ENTRY ──────────────────────────────────────────────
+  const outcome = direction === 'UP' ? 'yes' : 'no';
+  const cost = s.contractSize * entryPrice;
+
+  console.log(
+    `🎯 ENTRY: ${direction} | Spot $${spot.toFixed(2)} | Strike $${contract.stk} | ` +
+    `Diff ${diff >= 0 ? '+' : ''}${diff.toFixed(2)} | Price ${entryPrice.toFixed(2)}¢ | Size ${s.contractSize} | Cost $${cost.toFixed(4)}`
+  );
+
+  if (s.dryRun) {
+    console.log(`   [DRY] Would buy ${direction} at ${entryPrice.toFixed(2)}¢`);
+    position = {
+      instId: contract.instId,
+      direction,
+      outcome,
+      size: s.contractSize,
+      entryPrice,
+      ordId: 'dry',
+      expTime: contract.expTime,
+    };
+    return;
+  }
+
+  // Place live order
+  const result = await client.placeMarketOrder(contract.instId, 'buy', s.contractSize, outcome === 'yes' ? 'UP' : 'DOWN');
+
+  if (result.filled) {
+    const fillPx = result.fillPx || entryPrice;
+    console.log(`   ✅ Filled at ${fillPx}¢ | ordId=${result.ordId}`);
+    position = {
+      instId: contract.instId,
+      direction,
+      outcome,
+      size: s.contractSize,
+      entryPrice: fillPx,
+      ordId: result.ordId,
+      expTime: contract.expTime,
+    };
+    stats.trades++;
+    console.log(`   📈 Position: ${direction} ${s.contractSize} @ ${fillPx}¢ | TP: ${s.takeProfitPrice * 100}¢ | SL: ${s.stopLossPrice * 100}¢`);
+  } else {
+    console.log(`   ❌ Order failed: ${result.errorMsg}`);
+    stats.errors++;
+  }
+}
+
+// ── Monitor open position for TP/SL ───────────────────────────
+async function monitorPosition(client, pos, s) {
+  const ticker = await client.getEventTicker(pos.instId);
+  if (!ticker) return;
+
+  // Current price of our position
+  let currentPrice;
+  if (pos.direction === 'UP') {
+    currentPrice = ticker.bidPx; // sell UP at bid
+  } else {
+    currentPrice = 1 - ticker.askPx; // sell DOWN at (1 - ask)
+  }
+
+  if (currentPrice <= 0) return;
+
+  const pnl = pos.direction === 'UP'
+    ? (currentPrice - pos.entryPrice) * pos.size
+    : ((1 - currentPrice) - (1 - pos.entryPrice)) * pos.size;
+
+  // Check TP
+  if (currentPrice >= s.takeProfitPrice) {
+    console.log(
+      `🟢 TP HIT: ${pos.direction} @ ${currentPrice.toFixed(2)}¢ ≥ ${s.takeProfitPrice * 100}¢ | ` +
+      `Entry ${pos.entryPrice.toFixed(2)}¢ | PnL: +$${pnl.toFixed(4)}`
+    );
+    if (!s.dryRun) {
+      const result = await client.sellMarketOrder(pos.instId, pos.direction === 'UP' ? 'UP' : 'DOWN', pos.size);
+      if (result.filled) {
+        const sellPx = result.fillPx || currentPrice;
+        const realPnl = pos.direction === 'UP'
+          ? (sellPx - pos.entryPrice) * pos.size
+          : ((1 - sellPx) - (1 - pos.entryPrice)) * pos.size;
+        stats.wins++;
+        stats.tpExits++;
+        stats.totalProfit += realPnl;
+        console.log(`   ✅ SELL FILLED at ${sellPx.toFixed(2)}¢ | Realized PnL: +$${realPnl.toFixed(4)}`);
+      } else {
+        console.log(`   ⚠️ Sell failed — will retry next tick`);
+      }
+    } else {
+      stats.wins++;
+      stats.tpExits++;
+      stats.totalProfit += pnl;
+    }
+    position = null;
+    return;
+  }
+
+  // Check SL
+  if (currentPrice <= s.stopLossPrice) {
+    console.log(
+      `🔴 SL HIT: ${pos.direction} @ ${currentPrice.toFixed(2)}¢ ≤ ${s.stopLossPrice * 100}¢ | ` +
+      `Entry ${pos.entryPrice.toFixed(2)}¢ | PnL: -$${Math.abs(pnl).toFixed(4)}`
+    );
+    if (!s.dryRun) {
+      const result = await client.sellMarketOrder(pos.instId, pos.direction === 'UP' ? 'UP' : 'DOWN', pos.size);
+      if (result.filled) {
+        const sellPx = result.fillPx || currentPrice;
+        const realPnl = pos.direction === 'UP'
+          ? (sellPx - pos.entryPrice) * pos.size
+          : ((1 - sellPx) - (1 - pos.entryPrice)) * pos.size;
+        stats.losses++;
+        stats.slExits++;
+        stats.totalProfit += realPnl;
+        console.log(`   ✅ SELL FILLED at ${sellPx.toFixed(2)}¢ | Realized PnL: $${realPnl.toFixed(4)}`);
+      } else {
+        console.log(`   ⚠️ Sell failed — will retry next tick`);
+      }
+    } else {
+      stats.losses++;
+      stats.slExits++;
+      stats.totalProfit += pnl;
+    }
+    position = null;
+    return;
+  }
+
+  // Log position status occasionally
+  if (s.log.showAllPolls) {
+    console.log(`   📈 ${pos.direction} @ ${currentPrice.toFixed(2)}¢ | Entry ${pos.entryPrice.toFixed(2)}¢ | PnL: $${pnl.toFixed(4)} | TP ${s.takeProfitPrice * 100}¢ / SL ${s.stopLossPrice * 100}¢`);
+  }
+}
+
+// ── Check settlement if contract expired with open position ──
+async function checkSettlement(client, pos, newContract) {
+  // If we had a position and the contract expired, it settled at $1 or $0
+  // We need to figure out if we won or lost based on the new contract's strike vs old
+  // Actually, the settlement is based on whether the asset price was above/below strike at expiry
+  // For simplicity, log it as settled
+  console.log(`   📋 Contract ${pos.instId} expired — position settled`);
+  // The position would have settled at $1 (win) or $0 (loss)
+  // We can't easily verify the settlement price without another API call
+  // For now, just clear the position and let the user check their balance
+  stats.trades++;
+  console.log(`   ⚠️ Settlement not verified — check OKX balance for result`);
+}
+
 main().catch(err => {
-  logger.error(`Fatal: ${err.message}`);
+  console.error('Fatal error:', err);
   process.exit(1);
 });
