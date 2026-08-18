@@ -1,10 +1,6 @@
 /**
  * okxClient.js — OKX API Client (public market data + private trading)
- * 
- * Event contract outcomes: UP = "yes", DOWN = "no"
- * Liquidity check uses ticker bid/ask sizes (already polled every 3s)
  */
-
 const crypto = require('crypto');
 const logger = require('./logger');
 
@@ -26,7 +22,7 @@ class OKXClient {
     return crypto.createHmac('sha256', this.secretKey).update(msg).digest('base64');
   }
 
-  _headers(method, path, body = '', isPrivate) {
+  _headers(method, path, body = '', isPrivate = false) {
     if (!isPrivate) return { 'Content-Type': 'application/json' };
     if (!this.apiKey) throw new Error('API keys required for private endpoints');
     const ts = new Date().toISOString();
@@ -49,11 +45,9 @@ class OKXClient {
     }
     const url = this.baseURL + path;
     const bodyStr = body ? JSON.stringify(body) : '';
-    
     const gap = Date.now() - this._lastReq;
     if (gap < this._minGap) await sleep(this._minGap - gap);
     this._lastReq = Date.now();
-    
     try {
       const headers = this._headers(method, path, bodyStr, isPrivate);
       const res = await fetch(url, { method, headers, body: bodyStr || undefined });
@@ -64,8 +58,14 @@ class OKXClient {
     }
   }
 
-  // ── PUBLIC: Get event contract ticker ──────────────────────
-  // Returns ticker with bid/ask for liquidity check
+  // PUBLIC: Get spot price
+  async getSpotPrice(instId) {
+    const res = await this._request('GET', '/api/v5/market/ticker', { instId });
+    const d = res.data?.[0];
+    return d ? +d.last : null;
+  }
+
+  // PUBLIC: Get event contract ticker
   async getEventTicker(instId) {
     const res = await this._request('GET', '/api/v5/market/ticker', { instId });
     const d = res.data?.[0];
@@ -80,88 +80,41 @@ class OKXClient {
     };
   }
 
-  // ── PUBLIC: Check liquidity using ticker data ──────────────
-  // Uses the ticker's bid/ask sizes to check if there are sellers
-  //
-  // For event contracts:
-  // - Ticker shows UP (yes) market: askPx = sell UP price, bidPx = buy UP price
-  // - To buy UP (yes): need askSz > 0 (sellers of UP at askPx)
-  // - To buy DOWN (no): need bidSz > 0 (buyers of UP at bidPx; DOWN price = 1 - bidPx)
-  //
-  // ticker = the ticker we already polled (no extra API call needed)
-  // outcome = 'UP' or 'DOWN'
-  // minSize = contract size we need (e.g., 0.1)
-  // maxPrice = max price per side (e.g., 0.45)
-  checkLiquidityFromTicker(ticker, outcome, minSize, maxPrice) {
-    if (!ticker || !ticker.last) {
-      return { fillable: false, reason: 'no ticker', bestPrice: 0, size: 0 };
+  // PUBLIC: Get active event contract with strike price
+  async getActiveContract(seriesId) {
+    const path = `/api/v5/public/instruments?instType=EVENTS&seriesId=${encodeURIComponent(seriesId)}`;
+    const res = await this._request('GET', path);
+    if (res && res.code === '0' && Array.isArray(res.data) && res.data.length > 0) {
+      const now = Date.now();
+      const active = res.data
+        .map(item => ({
+          instId: item.instId,
+          stk: parseFloat(item.stk || '0'),
+          expTime: parseInt(item.expTime || '0', 10),
+          state: item.state,
+          lotSz: parseFloat(item.lotSz || '0.1'),
+        }))
+        .filter(c => c.state === 'live' && c.expTime > now && c.stk > 0)
+        .sort((a, b) => a.expTime - b.expTime);
+      return active[0] || null;
     }
-
-    if (outcome === 'UP') {
-      // Buying UP: need askSz (sellers of UP) at askPx <= maxPrice
-      const askPx = ticker.askPx;
-      const askSz = ticker.askSz;
-      if (askPx > 0 && askSz >= minSize && askPx <= maxPrice) {
-        return { fillable: true, bestPrice: askPx, size: askSz, reason: '' };
-      }
-      return {
-        fillable: false,
-        bestPrice: askPx,
-        size: askSz,
-        reason: askPx === 0 ? 'no asks' : askPx > maxPrice ? `ask ${askPx*100}¢ > max ${maxPrice*100}¢` : `askSz ${askSz} < ${minSize}`
-      };
-    } else {
-      // Buying DOWN: need bidSz (buyers of UP) at bidPx, DOWN price = 1 - bidPx
-      const bidPx = ticker.bidPx;
-      const bidSz = ticker.bidSz;
-      const downPrice = 1 - bidPx;
-      if (bidPx > 0 && bidSz >= minSize && downPrice <= maxPrice) {
-        return { fillable: true, bestPrice: downPrice, size: bidSz, reason: '' };
-      }
-      return {
-        fillable: false,
-        bestPrice: downPrice,
-        size: bidSz,
-        reason: bidPx === 0 ? 'no bids' : downPrice > maxPrice ? `down ${downPrice*100}¢ > max ${maxPrice*100}¢` : `bidSz ${bidSz} < ${minSize}`
-      };
-    }
+    return null;
   }
 
-  // ── PUBLIC: Get order book (for debugging) ──────────────────
-  async getOrderBook(instId) {
-    const res = await this._request('GET', '/api/v5/market/books', { instId, sz: '10' });
-    const d = res.data?.[0];
-    if (!d) return null;
-    return {
-      asks: (d.asks || []).map(a => ({ price: +a[0], size: +a[1] })),
-      bids: (d.bids || []).map(b => ({ price: +b[0], size: +b[1] })),
-      ts: d.ts,
-    };
-  }
-
-  // ── PUBLIC: Get spot price ─────────────────────────────────
-  async getSpotPrice(instId) {
-    const res = await this._request('GET', '/api/v5/market/ticker', { instId });
-    const d = res.data?.[0];
-    return d?.last ? +d.last : null;
-  }
-
-  // ── PRIVATE: Get balance ───────────────────────────────────
+  // PRIVATE: Get USDT balance
   async getUSDTBalance() {
     const res = await this._request('GET', '/api/v5/account/balance', { ccy: 'USDT' }, null, true);
     const det = res.data?.[0]?.details?.find(d => d.ccy === 'USDT');
     return det ? +det.availBal : 0;
   }
 
-  // ── PRIVATE: Get order details (verify fill) ──────────────
-  // Try multiple times with longer waits — event contracts may take longer to settle
+  // PRIVATE: Get order details
   async getOrderDetails(ordId, instId) {
     for (let attempt = 1; attempt <= 3; attempt++) {
       const params = { ordId };
       if (instId) params.instId = instId;
       const res = await this._request('GET', '/api/v5/trade/order', params, null, true);
       const d = res.data?.[0];
-      
       if (d) {
         return {
           ordId: d.ordId,
@@ -169,146 +122,45 @@ class OKXClient {
           fillPx: d.fillPx ? +d.fillPx : 0,
           fillSz: d.fillSz ? +d.fillSz : 0,
           avgPx: d.avgPx ? +d.avgPx : 0,
-          instId: d.instId,
-          side: d.side,
-          sz: d.sz ? +d.sz : 0,
         };
       }
-      
-      // Log raw response on first attempt for debugging
-      if (attempt === 1) {
-        logger.info(`   Order check attempt ${attempt}: raw response code=${res.code} msg=${res.msg} dataLen=${res.data?.length || 0}`);
-      }
-      
-      if (attempt < 3) await sleep(1000); // Wait 1s between retries
+      if (attempt < 3) await sleep(1000);
     }
-    
-    logger.warn(`   Order ${ordId}: could not get details after 3 attempts`);
     return null;
   }
 
-  // ── PRIVATE: Place market order ────────────────────────────
+  // PRIVATE: Place market order
   async placeMarketOrder(instId, side, size, outcome) {
-    const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
-    
-    const szStr = String(size);
+    const okxOutcome = outcome === 'UP' ? 'yes' : 'no';
     const body = {
       instId,
       tdMode: 'isolated',
       side,
       ordType: 'market',
-      sz: szStr,
-      outcome: okxOutcome,
-    };
-    
-    logger.info(`📤 Order body: instId=${instId} sz=${szStr} outcome=${okxOutcome} side=${side} tdMode=isolated ordType=market`);
-    
-    const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
-    
-    const d = res?.data?.[0] || {};
-    const ordId = d.ordId || null;
-    const errorCode = d.sCode || res.code || '';
-    const errorMsg = d.sMsg || res.msg || '';
-    
-    if (!ordId) {
-      logger.error(
-        `OKX order FAILED: instId=${instId} side=${side} sz=${size} outcome=${okxOutcome} | ` +
-        `code=${errorCode} msg=${errorMsg} | full=${JSON.stringify(d)}`
-      );
-      return { ordId: null, errorCode, errorMsg, filled: false, fillPx: 0, fillSz: 0, raw: d };
-    }
-    
-    // Order accepted — verify it actually filled (wait 2s, then check with retries)
-    logger.info(`OKX order accepted: ${ordId}, verifying fill (2s wait)...`);
-    await sleep(2000);
-    
-    const details = await this.getOrderDetails(ordId, instId);
-    if (details) {
-      const state = details.state;
-      // Accept any state that means the order executed
-      const isFilled = ['filled', 'partially_filled', 'effective'].includes(state);
-      
-      if (isFilled) {
-        logger.info(
-          `✅ FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
-          `state=${state} fillPx=${details.fillPx} fillSz=${details.fillSz}`
-        );
-        return { ordId, errorCode: '', errorMsg: '', filled: true, fillPx: details.fillPx, fillSz: details.fillSz, raw: d };
-      } else {
-        logger.warn(
-          `⚠️ NOT FILLED: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
-          `state=${state} fillSz=${details.fillSz}`
-        );
-        return { ordId, errorCode: 'not_filled', errorMsg: `Order state: ${state}`, filled: false, fillPx: details.fillPx, fillSz: details.fillSz, raw: d };
-      }
-    } else {
-      logger.warn(
-        `⚠️ UNVERIFIABLE: ${instId} outcome=${okxOutcome} | ordId=${ordId} | ` +
-        `could not retrieve order details after 3 attempts`
-      );
-      return { ordId, errorCode: 'unverifiable', errorMsg: 'Could not verify fill', filled: false, fillPx: 0, fillSz: 0, raw: d };
-    }
-  }
-
-
-  // ── PUBLIC: Get active event contract with strike price ──
-  async getActiveContract(seriesId) {
-    const path = `/api/v5/public/instruments?instType=EVENTS&seriesId=${encodeURIComponent(seriesId)}`;
-    const res = await this._request('GET', path, null, false);
-
-    if (res && res.code === '0' && Array.isArray(res.data) && res.data.length > 0) {
-      const now = Date.now();
-      const active = res.data
-        .map((item) => ({
-          instId: item.instId,
-          stk: parseFloat(item.stk || '0'),
-          expTime: parseInt(item.expTime || '0', 10),
-          state: item.state,
-          lotSz: parseFloat(item.lotSz || '0.1'),
-        }))
-        .filter((c) => c.state === 'live' && c.expTime > now && c.stk > 0)
-        .sort((a, b) => a.expTime - b.expTime);
-
-      return active[0] || null;
-    }
-    return null;
-  }
-
-  // ── PRIVATE: Sell market order (for TP/SL exits) ──────────
-  async sellMarketOrder(instId, outcome, size) {
-    const okxOutcome = outcome === 'UP' ? 'yes' : outcome === 'DOWN' ? 'no' : outcome;
-    const body = {
-      instId,
-      tdMode: 'isolated',
-      side: 'sell',
-      ordType: 'market',
       sz: String(size),
       outcome: okxOutcome,
     };
-
-    logger.info(`📤 SELL order: instId=${instId} sz=${size} outcome=${okxOutcome} side=sell`);
-
+    logger.info(`📤 Order: ${instId} ${side} ${size} ${okxOutcome}`);
     const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
     const d = res?.data?.[0] || {};
     const ordId = d.ordId || null;
-    const errorCode = d.sCode || res.code || '';
-    const errorMsg = d.sMsg || res.msg || '';
-
     if (!ordId) {
-      logger.error(`SELL FAILED: ${instId} outcome=${okxOutcome} | code=${errorCode} msg=${errorMsg}`);
-      return { ordId: null, filled: false, errorMsg };
+      logger.error(`Order FAILED: ${instId} code=${d.sCode || res.code} msg=${d.sMsg || res.msg}`);
+      return { ordId: null, filled: false, fillPx: 0, errorMsg: d.sMsg || res.msg };
     }
-
-    // Verify fill
+    logger.info(`Order accepted: ${ordId}, verifying fill...`);
     await sleep(2000);
     const details = await this.getOrderDetails(ordId, instId);
-    if (details && ['filled', 'partially_filled', 'effective'].includes(details.state)) {
-      logger.info(`✅ SELL FILLED: ${instId} | ordId=${ordId} | fillPx=${details.fillPx} fillSz=${details.fillSz}`);
-      return { ordId, filled: true, fillPx: details.fillPx, fillSz: details.fillSz };
+    if (details) {
+      const isFilled = ['filled', 'partially_filled', 'effective'].includes(details.state);
+      if (isFilled) {
+        logger.info(`✅ FILLED: ${instId} ${okxOutcome} @ ${details.fillPx} | ordId=${ordId}`);
+        return { ordId, filled: true, fillPx: details.fillPx, fillSz: details.fillSz };
+      }
+      logger.warn(`⚠️ NOT FILLED: ${instId} state=${details.state}`);
+      return { ordId, filled: false, fillPx: 0, errorMsg: `state=${details.state}` };
     }
-
-    logger.warn(`⚠️ SELL UNVERIFIED: ${instId} | ordId=${ordId} | state=${details?.state || 'unknown'}`);
-    return { ordId, filled: false, errorMsg: details?.state || 'unverified' };
+    return { ordId, filled: false, fillPx: 0, errorMsg: 'unverifiable' };
   }
 }
 
