@@ -101,11 +101,57 @@ class OKXClient {
     return null;
   }
 
-  // PRIVATE: Get USDT balance
+  // PRIVATE: Get USDT balance — checks BOTH trading + funding accounts
+  // OKX event contracts are funded from the trading (unified) account.
+  // But users may have funds in the funding account — we check both and log each.
   async getUSDTBalance() {
-    const res = await this._request('GET', '/api/v5/account/balance', { ccy: 'USDT' }, null, true);
-    const det = res.data?.[0]?.details?.find(d => d.ccy === 'USDT');
-    return det ? +det.availBal : 0;
+    let tradingBal = 0;
+    let fundingBal = 0;
+
+    try {
+      // 1. Unified trading account
+      const tradingRes = await this._request('GET', '/api/v5/account/balance', { ccy: 'USDT' }, null, true);
+      logger.info(`  [balance] Trading account raw: code=${tradingRes.code} dataLen=${tradingRes.data?.length ?? 0}`);
+      if (tradingRes.code === '0' && tradingRes.data?.[0]) {
+        const det = tradingRes.data[0].details?.find(d => d.ccy === 'USDT');
+        if (det) {
+          tradingBal = +det.availBal || 0;
+          logger.info(`  [balance] Trading USDT availBal=${det.availBal} eqUsd=${det.eqUsd || '?'}`);
+        } else {
+          // Log all currencies found so we can debug
+          const ccys = (tradingRes.data[0].details || []).map(d => `${d.ccy}=${d.availBal}`).join(', ');
+          logger.info(`  [balance] Trading account currencies: ${ccys || '(none)'}`);
+        }
+      } else {
+        logger.warn(`  [balance] Trading account error: ${tradingRes.msg || JSON.stringify(tradingRes)}`);
+      }
+    } catch (e) {
+      logger.warn(`  [balance] Trading account fetch error: ${e.message}`);
+    }
+
+    try {
+      // 2. Funding account (asset balance)
+      const fundingRes = await this._request('GET', '/api/v5/asset/balances', { ccy: 'USDT' }, null, true);
+      logger.info(`  [balance] Funding account raw: code=${fundingRes.code} dataLen=${fundingRes.data?.length ?? 0}`);
+      if (fundingRes.code === '0' && Array.isArray(fundingRes.data)) {
+        const det = fundingRes.data.find(d => d.ccy === 'USDT');
+        if (det) {
+          fundingBal = +det.availBal || 0;
+          logger.info(`  [balance] Funding USDT availBal=${det.availBal}`);
+        } else {
+          const ccys = fundingRes.data.map(d => `${d.ccy}=${d.availBal}`).join(', ');
+          logger.info(`  [balance] Funding account currencies: ${ccys || '(none)'}`);
+        }
+      } else {
+        logger.warn(`  [balance] Funding account error: ${fundingRes.msg || JSON.stringify(fundingRes)}`);
+      }
+    } catch (e) {
+      logger.warn(`  [balance] Funding account fetch error: ${e.message}`);
+    }
+
+    const total = tradingBal + fundingBal;
+    logger.info(`  [balance] Trading: $${tradingBal.toFixed(4)} | Funding: $${fundingBal.toFixed(4)} | Total: $${total.toFixed(4)}`);
+    return total;
   }
 
   // PRIVATE: Get order details

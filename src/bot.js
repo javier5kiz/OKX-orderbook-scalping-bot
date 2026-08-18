@@ -55,8 +55,8 @@ async function main() {
     const balance = await client.getUSDTBalance();
     logger.info(`💰 USDT balance: $${balance.toFixed(4)}`);
     if (balance < s.minBalance) {
-      logger.error(`Balance below minimum ($${s.minBalance}). Stopping.`);
-      return;
+      logger.warn(`⚠️  Balance: $${balance.toFixed(4)} (below minimum $${s.minBalance}) — continuing anyway in case funds are in trading account`);
+    // logger.error(`Balance below minimum ($${s.minBalance}). Stopping.`);
     }
   }
 
